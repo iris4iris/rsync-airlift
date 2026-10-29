@@ -13,9 +13,9 @@ class BatchPlanningTest {
         assertFailsWith<IllegalArgumentException> { batchSize("0MiB") }
     }
 
-    @Test fun `default batches target five MiB and decimal units differ from binary`() {
-        val files = (1..6).map { TransferTask("f$it", 1048576) }
-        assertEquals(listOf(5, 1), batchSmallFiles(files).map { it.fileCount })
+    @Test fun `default batches target ten MiB and decimal units differ from binary`() {
+        val files = (1..11).map { TransferTask("f$it", 1048576) }
+        assertEquals(listOf(10, 1), batchSmallFiles(files).map { it.fileCount })
         assertEquals(5_000_000L, batchSize("5MB"))
         assertEquals(5_242_880L, batchSize("5MiB"))
         assertEquals(5_000_000L, batchSize("5mb"))

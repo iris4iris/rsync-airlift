@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.*
 
 class SkippedFilesTest {
-    @Test fun `successful rsync with zero statistics finishes full file progress and counts as matched`(): Unit = kotlinx.coroutines.runBlocking {
+    @Test fun `successful rsync with zero statistics finishes full file progress and counts as skipped`(): Unit = kotlinx.coroutines.runBlocking {
         val root = Files.createTempDirectory("airlift-skipped-")
         try {
             val sessions = TransferSessionFactory {
@@ -33,11 +33,11 @@ class SkippedFilesTest {
                 assertEquals(1024L, result.tasks.single().progress?.logicalBytes)
                 assertEquals(1.0, MonitorModel.overallProgress(result))
                 val breakdown = OverallBreakdown.from(result)
-                assertEquals(1024L, breakdown.matchedBytes)
-                assertEquals(1.0, breakdown.matched)
+                assertEquals(1024L, breakdown.skippedBytes)
+                assertEquals(1.0, breakdown.skipped)
                 assertEquals(0.0, breakdown.other)
                 assertEquals(0L, breakdown.literalBytes)
-                assertEquals(20, breakdown.segments(20).filter { it.color == MonitorColor.ANSI.CYAN }.sumOf { it.text.length })
+                assertEquals(20, breakdown.segments(20).filter { it.color == MonitorColor.ANSI.BLUE }.sumOf { it.text.length })
             }
         } finally { root.toFile().deleteRecursively() }
     }

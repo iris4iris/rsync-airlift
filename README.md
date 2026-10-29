@@ -85,7 +85,7 @@ and file scheduling together in one terminal workflow.
 - **Put available resources to work.** The CLI collects file sizes before
   transfer and schedules the largest files first. A shared queue feeds each
   available worker its next job. Small files are grouped into batches with a
-  default minimum load of 5 MiB, amortizing local and remote rsync startup across
+  default minimum load of 10 MiB, amortizing local and remote rsync startup across
   many files. Each worker also reuses its SSH ControlMaster connection across jobs.
   This can reduce waiting on workloads with independent
   files and spare CPU, storage, or network capacity; it does not guarantee a
@@ -143,7 +143,7 @@ assignment of new files, or detach the panel and attach again later.
 and details for the selected worker. Columns are added when the available height fills up.*
 
 The overall bar separates data that did not need to be sent from newly transferred
-file data and failures. `Matched` includes unchanged files that rsync skipped;
+file data and failures. `Skipped` shows unchanged files that rsync skipped;
 it does not imply that every byte was checksum-verified. `Processed` and the
 displayed speeds describe logical file processing, not measured network traffic.
 
@@ -285,7 +285,7 @@ modes do not ask for transfer confirmation.
 | --- | --- |
 | `--workers N` | Initial target concurrency; 16 for real transfers, 4 for demo |
 | `--rsync "OPTIONS"` | Copy options passed to rsync; no archive/partial/bandwidth policy is injected |
-| `--batch-min-size SIZE` | Minimum accumulated job size; `5MiB` |
+| `--batch-min-size SIZE` | Minimum accumulated job size; `10MiB` |
 | `--files FILE` | UTF-8 relative file list; one path per line |
 | `--null` | Read the list as NUL-separated paths instead |
 | `--port N` | SSH port; 22 |
@@ -383,7 +383,7 @@ queue ends, or the source root changes. A large file naturally fills a job on it
 own in the descending-size prefix. The final job may be smaller; there is no
 file-count limit, so zero-length files can share one invocation.
 
-The default is **5MiB = 5,242,880 bytes**. Units are case-insensitive: decimal
+The default is **10MiB = 10,485,760 bytes**. Units are case-insensitive: decimal
 `KB`/`MB`/`GB`, binary `KiB`/`MiB`/`GiB`, or an integer byte count without a suffix.
 For example, `--batch-min-size 5MB` means 5,000,000 bytes.
 
@@ -512,15 +512,15 @@ Overall statistics:
 
 - **Processed** is logical work, not network traffic. The displayed byte count
   includes successful job sizes and reported progress of running jobs.
-- **Matched** includes rsync's matched blocks and successfully skipped/inferred
-  bytes that did not need to be sent. **New** is rsync's literal-data counter.
+- **Skipped** shows successful bytes outside rsync's matched/literal counters.
+  **Matched** is rsync's matched blocks; **New** is its literal-data counter.
   These are not compressed wire-byte measurements or proof of a checksum audit.
   Filters and dry runs can also avoid transfer; interpret the figures according
   to your rsync options.
-- Percentages beside Matched/New use the already processed byte count, not the
+- Percentages beside Skipped/Matched/New use the already processed byte count, not the
   full dataset. Their sum may be below 100% while final statistics are pending.
 - The overall bar counts successful and finally failed jobs at full weight, so
-  completed work with errors can still reach 100%. Colors: cyan matched, green
+  completed work with errors can still reach 100%. Colors: blue skipped, cyan matched, green
   new or processed work awaiting a final breakdown, red failed, yellow the
   remaining work of active jobs. Queued work stays blank. The colored extent
   therefore includes active reservations and may exceed the processed percentage.
@@ -529,9 +529,9 @@ Overall statistics:
   worker bars split by those statistics; live bars show ordinary logical progress.
 - Live speed uses fresh rates; readings expire after three seconds. The previous
   complete aggregate is retained for up to three seconds during job handovers.
-  ETA uses available rates when sizes are known, the queue is not paused, and no
-  files have failed. Otherwise ETA is unknown.
-- At completion, overall speed is recorded processed bytes divided by dispatcher
+  ETA takes the maximum of the aggregate estimate and reported running-worker
+  estimates, unless the queue is paused or files have failed.
+- At completion, overall speed is processed bytes excluding Skipped divided by dispatcher
   elapsed time, and ETA disappears. A successful worker's final speed is its job
   size divided by processing time, including retries/backoff but excluding queue
   wait and initial SSH connection. Final worker ETA is blank.
@@ -570,7 +570,7 @@ run the attach command through SSH on the dispatcher host, with a PTY.
 Connection files are never overwritten. If one exists, attach to that dispatcher
 or choose a different `--endpoint`. After an unclean termination, remove a stale
 file only after confirming that its dispatcher is no longer running. Normal
-shutdown removes the connection file. The protocol is version **3**; update
+shutdown removes the connection file. The protocol is version **4**; update
 dispatcher and attached monitors together when the protocol changes.
 
 ## Midnight Commander
@@ -742,7 +742,7 @@ Service lifetime uses coroutine completion/cancellation; the JVM entry point onl
 bridges main/runBlocking, stderr and process exit. JVM adapters provide the
 socket service/client, shutdown-hook registration and temporary directories.
 
-The monitor client/server and protocol-3 codec live in common code. The server
+The monitor client/server and protocol-4 codec live in common code. The server
 uses two coroutine handlers and a bounded queue of 16 waiting connections.
 JVM adapters provide loopback sockets with connect/read timeouts and cancellation
 cleanup; token generation and protected connection-file persistence are separate

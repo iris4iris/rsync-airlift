@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.io.files.Path
 
-private const val PROTOCOL = 3
+private const val PROTOCOL = 4
 private const val VERSION_ERROR = "Monitor protocol changed. Restart dispatcher and monitor together."
 
 /** Local authenticated endpoint. Transport supplies only loopback sockets. */

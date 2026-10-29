@@ -208,9 +208,6 @@ class AirliftDispatcher(
                     val finalProgress = if (success && !cancelled) {
                         (current.progress ?: TransferProgress(size ?: 0, null, null)).copy(
                             logicalBytes = size ?: current.progress?.logicalBytes ?: 0,
-                            matchedBytes = if (task.fileCount > 1 && size != null && current.progress?.matchedBytes != null && current.progress.literalBytes != null)
-                                current.progress.matchedBytes + (size - current.progress.matchedBytes - current.progress.literalBytes).coerceAtLeast(0)
-                                else current.progress?.matchedBytes,
                             bytesPerSecond = size?.toDouble()?.div(elapsedSeconds), remainingSeconds = null, percent = 100,
                         )
                     } else current.progress

@@ -169,7 +169,7 @@ class AirliftDispatcherTest {
             assertEquals(2, result.tasks.single().attempts)
             assertEquals(listOf("worker-1-task-0-attempt-1.log", "worker-1-task-0-attempt-2.log"), logs.attempts)
             val final = result.tasks.single().progress!!
-            assertEquals(90, final.matchedBytes)
+            assertEquals(50, final.matchedBytes)
             assertEquals(10, final.literalBytes)
             assertEquals(100.0 / 1.2, final.bytesPerSecond)
             assertNull(final.remainingSeconds)

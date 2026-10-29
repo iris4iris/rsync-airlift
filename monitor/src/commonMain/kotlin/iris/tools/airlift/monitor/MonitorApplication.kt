@@ -22,7 +22,7 @@ internal suspend fun launchMonitor(args: List<String>, platform: MonitorApplicat
             Without --files: discover source files. Mask + --files: union without duplicates.
             With --files and no mask: use only the list. All sizes are collected before copying.
             Tasks run largest first. Remote discovery requires GNU find over SSH.
-            --batch-min-size SIZE fills each rsync job to SIZE or more (default 5MiB; MB is decimal).
+            --batch-min-size SIZE fills each rsync job to SIZE or more (default 10MiB; MB is decimal).
             Confirm From/To before real transfers; --yes skips confirmation for automation.
             MC /sh://user@host/path endpoints are recognized automatically (--mc is optional).
             --demo is simulated data, not network traffic. No arguments starts no transfers.
@@ -74,7 +74,7 @@ internal suspend fun launchMonitor(args: List<String>, platform: MonitorApplicat
     val config = plan.config
     val tasks = if (demo) plan.tasks else {
         val collapser = DirectoryCollapser(plan.inventories, options["--rsync"])
-        batchSmallFiles(plan.tasks, batchSize(options["--batch-min-size"] ?: "5MiB")).map(collapser::optimize)
+        batchSmallFiles(plan.tasks, batchSize(options["--batch-min-size"] ?: "10MiB")).map(collapser::optimize)
     }
     if (!demo) println("${plan.tasks.size} files scheduled in ${tasks.size} rsync jobs; " +
         "${tasks.sumOf { it.entries.ifEmpty { it.files.ifEmpty { listOf(it.path) } }.size }} file-list entries after directory optimization.")

@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.*
 
 class BatchExecutionTest {
-    @Test fun `one batch invokes one session transfer counts files and includes skipped bytes in matched`(): Unit = kotlinx.coroutines.runBlocking {
+    @Test fun `one batch invokes one session transfer counts files and retains raw matched and separates skipped bytes`(): Unit = kotlinx.coroutines.runBlocking {
         val root = Files.createTempDirectory("airlift-batch-")
         try {
             val task = TransferTask("a", 1000, files = listOf("a", "b", "c"))
@@ -29,7 +29,7 @@ class BatchExecutionTest {
                 val final = run { dispatcher.start(); kotlinx.coroutines.withTimeout(5000) { dispatcher.awaitCompletion() } }
                 assertEquals(1, calls)
                 assertEquals(3, final.completed)
-                assertEquals(900L, final.tasks.single().progress?.matchedBytes)
+                assertEquals(400L, final.tasks.single().progress?.matchedBytes)
                 assertEquals(100L, final.tasks.single().progress?.literalBytes)
                 val parts = WorkerLineLayout(88).segments(final.workers.single(), final.tasks.single())
                 assertTrue(parts.any { it.color == MonitorColor.ANSI.CYAN && it.text.contains('|') })
@@ -45,6 +45,8 @@ class BatchExecutionTest {
                     val remote = RemoteMonitorSource(endpoint.toPortablePath()).snapshot()
                     assertEquals(3, remote.completed)
                     assertEquals(task.files, remote.tasks.single().task.files)
+                    assertEquals(500L, OverallBreakdown.from(remote).skippedBytes)
+                    assertEquals(400L, OverallBreakdown.from(remote).matchedBytes)
                     assertEquals("b", remote.tasks.single().progress?.currentFile)
                     assertEquals(1, remote.tasks.single().progress?.transferredFiles)
                 }

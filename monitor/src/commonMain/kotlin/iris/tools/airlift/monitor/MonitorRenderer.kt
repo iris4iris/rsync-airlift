@@ -64,12 +64,19 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
             else if (it.status == TaskStatus.RUNNING) (it.progress?.logicalBytes ?: 0).let { count -> it.task.size?.let { size -> count.coerceAtMost(size) } ?: count }
             else 0
         }
-        val eta = if (allKnown && rate != null && rate > 0 && snapshot.failed == 0 && !snapshot.paused)
+        val calculatedEta = if (allKnown && rate != null && rate > 0)
             ceil((total - processed).coerceAtLeast(0) / rate).toLong() else null
+        val longestWorkerEta = snapshot.tasks.asSequence()
+            .filter { it.status == TaskStatus.RUNNING && !MonitorModel.finishing(it) }
+            .mapNotNull { it.progress?.remainingSeconds?.takeIf { seconds -> seconds >= 0 } }
+            .maxOrNull()
+        val eta = if (snapshot.failed == 0 && !snapshot.paused)
+            listOfNotNull(calculatedEta, longestWorkerEta).maxOrNull() else null
+        val breakdown = OverallBreakdown.from(snapshot)
         val finished = snapshot.finishedAtMillis != null
         val displayRate = if (finished) snapshot.startedAtMillis?.let { start ->
             val elapsedMillis = requireNotNull(snapshot.finishedAtMillis) - start
-            if (elapsedMillis > 0) processed.toDouble() * 1000 / elapsedMillis else null
+            if (elapsedMillis > 0) (processed - breakdown.skippedBytes).coerceAtLeast(0).toDouble() * 1000 / elapsedMillis else null
         } else rate
         val etaText = if (finished) "" else " | ETA ${duration(eta)}"
         val ratio = MonitorModel.overallProgress(snapshot)
@@ -82,7 +89,6 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
         val failedText = if (snapshot.failed > 0) " | Failed ${snapshot.failed}" else ""
         line(3, "Workers $workerCount | Files ${snapshot.completed}/${snapshot.tasks.sumOf { it.task.fileCount }}$failedText | Elapsed ${duration(elapsed)}")
         line(4, "Processed ${bytes(processed)} / ${if (allKnown) bytes(total) else "unknown total"} | ${displayRate?.let { bytes(it.toLong()) + "/s" } ?: "--/s"}$etaText")
-        val breakdown = OverallBreakdown.from(snapshot)
         val barWidth = (width - 10).coerceAtMost(100)
         segments(0, 5, listOf(RowSegment("[")) + breakdown.segments(barWidth) +
             RowSegment("] ${fixedOne(ratio * 100) + "%"}"), width)
@@ -143,7 +149,7 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
             line(y + 3, error?.let { "Error: $it" } ?: "", MonitorColor.ANSI.RED)
         }
         segments(0, height - 2, if (model.message.isNotEmpty()) listOf(RowSegment(model.message, MonitorColor.ANSI.YELLOW)) else listOf(
-            RowSegment("Overall: "), RowSegment("matched ", MonitorColor.ANSI.CYAN), RowSegment("new/processed ", MonitorColor.ANSI.GREEN),
+            RowSegment("Overall: "), RowSegment("skipped ", MonitorColor.ANSI.BLUE), RowSegment("matched ", MonitorColor.ANSI.CYAN), RowSegment("new/processed ", MonitorColor.ANSI.GREEN),
             RowSegment("failed ", MonitorColor.ANSI.RED), RowSegment("active remaining", MonitorColor.ANSI.YELLOW)), width)
         line(height - 1, "Arrows Select | F2 Details | P Pause | +/- Workers | Q ${if (snapshot.finishedAtMillis == null) "Detach" else "Exit"}", MonitorColor.ANSI.CYAN)
         return screen

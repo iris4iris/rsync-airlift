@@ -3,7 +3,7 @@ package iris.tools.airlift.monitor
 import iris.tools.airlift.TransferTask
 
 /** Fill until the minimum byte load is reached, or the queue/source root ends. */
-internal fun batchSmallFiles(tasks: List<TransferTask>, minBytes: Long = 5L * 1024 * 1024): List<TransferTask> {
+internal fun batchSmallFiles(tasks: List<TransferTask>, minBytes: Long = 10L * 1024 * 1024): List<TransferTask> {
     require(minBytes > 0)
     val result = mutableListOf<TransferTask>()
     val pending = mutableListOf<TransferTask>()
