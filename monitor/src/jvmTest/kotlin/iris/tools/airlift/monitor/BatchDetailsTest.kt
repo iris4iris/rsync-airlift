@@ -8,9 +8,10 @@ import kotlin.test.*
 
 class BatchDetailsTest {
     @Test fun `successful batch shows all processed rather than stale last announced position`() {
-        val task = TransferTask("f0", 1000, files = (0..221).map { "f$it" })
+        // A monitor copy carries only the file total; the dispatcher reports the 1-based index.
+        val task = TransferTask("f0", 1000, fileTotal = 222)
         val state = TaskState(task, TaskStatus.RUNNING, progress = TransferProgress(1000, 100.0, null,
-            currentFile = "f52", transferredFiles = 6))
+            currentFile = "f52", transferredFiles = 6, currentFileIndex = 53))
         val snapshot = AirliftSnapshot(listOf(state), listOf(WorkerState(4, WorkerStatus.TRANSFERRING, task.id)), false, false)
         val source = object : MonitorSource {
             override suspend fun snapshot() = snapshot

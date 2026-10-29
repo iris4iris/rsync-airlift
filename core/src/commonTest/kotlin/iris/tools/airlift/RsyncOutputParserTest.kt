@@ -16,4 +16,27 @@ class RsyncOutputParserTest {
         assertNull(RsyncOutputParser().parse("permission denied"))
         assertNull(RsyncOutputParser().parse("Literal data: nonsense bytes"))
     }
+
+    @Test fun `non-ASCII names escaped by rsync in the C locale match the submitted list`() {
+        // Captured from rsync 3.2.7 with LC_ALL=C for "файл.bin".
+        val parser = RsyncOutputParser(listOf("plain.bin", "dir/файл.bin"))
+        val progress = parser.parse("AIRLIFT_FILE:dir/\\#321\\#204\\#320\\#260\\#320\\#271\\#320\\#273.bin")!!
+        assertEquals("dir/файл.bin", progress.currentFile)
+        assertEquals(2, progress.currentFileIndex)
+        assertEquals(1, parser.parse("AIRLIFT_FILE:plain.bin")!!.currentFileIndex)
+        assertNull(parser.parse("AIRLIFT_FILE:unknown.bin"))
+    }
+
+    @Test fun `escape decoding keeps literal text emoji and an escaped backslash`() {
+        assertEquals("a\\#12b", RsyncText.decode("a\\#134#12b"))
+        assertEquals("tab\there", RsyncText.decode("tab\\#011here"))
+        assertEquals("😀 ok", RsyncText.decode("😀 ok"))
+        assertEquals("\\#9", RsyncText.decode("\\#9"))
+    }
+
+    @Test fun `plain byte counts printed with --no-human-readable are parsed`() {
+        val parser = RsyncOutputParser()
+        assertEquals(5_000_000, parser.parse("        5000000 100%  175.45MB/s    0:00:00 (xfr#2, to-chk=0/2)")!!.logicalBytes)
+        assertEquals(5_000_000, parser.parse("Literal data: 5000000 bytes")!!.literalBytes)
+    }
 }

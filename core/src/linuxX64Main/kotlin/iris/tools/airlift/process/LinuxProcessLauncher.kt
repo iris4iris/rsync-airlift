@@ -2,6 +2,7 @@
 package iris.tools.airlift.process
 
 import iris.tools.airlift.*
+import iris.tools.airlift.io.LinuxFdPoller
 import iris.tools.airlift.posix.*
 import kotlinx.cinterop.*
 import kotlinx.coroutines.*
@@ -10,7 +11,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.io.files.Path
 import platform.posix.*
 
-/** POSIX fork/exec runs in a C shim: the child never enters the Kotlin runtime. */
+/** POSIX vfork/exec runs in a C shim: the child never enters the Kotlin runtime. */
 class LinuxProcessLauncher : ProcessLauncher {
     override suspend fun start(spec: ProcessSpec): ChildProcess {
         val child = withContext(NonCancellable) { withContext(Dispatchers.IO) { spawn(spec) } }
@@ -77,7 +78,11 @@ private class LinuxChildProcess(private val pid: Int, input: Int, output: Int, e
         }
         result
     }
-    override suspend fun awaitExit(): Int { while (true) { exitCode()?.let { return it }; delay(10) } }
+    /** Polls waitpid with a growing pause: prompt for short-lived children, about 20 checks a second after that. */
+    override suspend fun awaitExit(): Int {
+        var pause = 1L
+        while (true) { exitCode()?.let { return it }; delay(pause); pause = minOf(pause * 2, 50L) }
+    }
     override suspend fun awaitExit(timeoutMillis: Long): Int? = withTimeoutOrNull(timeoutMillis) { awaitExit() }
     override suspend fun terminate(force: Boolean) { state.withLock {
         if (result == null && kill(pid, if (force) SIGKILL else SIGTERM) != 0 && errno != ESRCH) posixFailure("kill")
@@ -96,38 +101,53 @@ private class LinuxChildProcess(private val pid: Int, input: Int, output: Int, e
         }
     } } }
 
+    /** Non-blocking descriptor; EAGAIN waits register with [LinuxFdPoller] under [lock], before close can run. */
     private inner class Pipe(private var fd: Int) {
         private val lock = Mutex()
         fun source() = object : ProcessByteSource {
             override suspend fun read(buffer: ByteArray): Int = readBytes(buffer)
             override suspend fun close() = closePipe()
         }
-        suspend fun closePipe() { lock.withLock { if (fd >= 0) { platform.posix.close(fd); fd = -1 } } }
+        suspend fun closePipe() {
+            lock.withLock {
+                if (fd >= 0) { val closing = fd; fd = -1; platform.posix.close(closing); LinuxFdPoller.release(closing) }
+            }
+        }
         suspend fun readBytes(bytes: ByteArray): Int {
             if (bytes.isEmpty()) return 0
             try { while (true) {
                 currentCoroutineContext().ensureActive()
+                var wait: LinuxFdPoller.Registration? = null
                 val count = lock.withLock {
                     check(fd >= 0) { "Process pipe is closed" }
                     bytes.usePinned { read(fd, it.addressOf(0), bytes.size.toULong()) }.also {
-                        if (it < 0 && errno != EAGAIN && errno != EINTR) posixFailure("read process pipe")
+                        if (it < 0) {
+                            val error = errno
+                            if (error == EAGAIN) wait = LinuxFdPoller.readable(fd)
+                            else if (error != EINTR) posixFailure("read process pipe", error)
+                        }
                     }
                 }
                 if (count >= 0) return if (count == 0L) -1 else count.toInt()
-                delay(10)
+                wait?.await()
             } } catch (cancelled: CancellationException) { withContext(NonCancellable) { terminate(true) }; throw cancelled }
         }
         suspend fun writeBytes(bytes: ByteArray) {
             var offset = 0
             try { while (offset < bytes.size) {
                 currentCoroutineContext().ensureActive()
+                var wait: LinuxFdPoller.Registration? = null
                 val count = lock.withLock {
                     check(fd >= 0) { "Process pipe is closed" }
                     bytes.usePinned { airlift_write(fd, it.addressOf(offset), (bytes.size - offset).toULong()) }.also {
-                        if (it < 0 && errno != EAGAIN && errno != EINTR) posixFailure("write process pipe")
+                        if (it < 0) {
+                            val error = errno
+                            if (error == EAGAIN) wait = LinuxFdPoller.writable(fd)
+                            else if (error != EINTR) posixFailure("write process pipe", error)
+                        }
                     }
                 }
-                if (count > 0) offset += count.toInt() else delay(10)
+                if (count > 0) offset += count.toInt() else wait?.await()
             } } catch (cancelled: CancellationException) { withContext(NonCancellable) { terminate(true) }; throw cancelled }
         }
     }

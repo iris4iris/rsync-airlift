@@ -49,6 +49,22 @@ class JvmProcessTest {
         }
     }
 
+    @Test fun `many children blocked on reads do not starve the writes that feed them`() = runBlocking<Unit> {
+        // sort prints nothing until stdin closes. With readers started first, 80 blocked reads exceed
+        // Dispatchers.IO's 64 threads; the writes must still run or every child waits forever.
+        withTimeout(60_000) {
+            val processes = (1..80).map { launcher.start(ProcessSpec(listOf("sort"))) }
+            try {
+                val outputs = processes.map { process -> async(Dispatchers.Default) { process.stdout!!.bytes() } }
+                delay(500)
+                processes.map { process ->
+                    async(Dispatchers.Default) { process.stdin!!.write("b\r\na\r\n".encodeToByteArray()); process.stdin!!.close() }
+                }.awaitAll()
+                outputs.awaitAll().forEach { assertEquals(listOf("a", "b"), it.decodeToString().lines().map(String::trim).filter(String::isNotEmpty)) }
+            } finally { processes.forEach { it.close() } }
+        }
+    }
+
     @Test fun `stderr can be separate or merged`() = runBlocking<Unit> {
         for (merge in listOf(false, true)) {
             val process = launcher.start(ProcessSpec(command("separate"), mergeError = merge))

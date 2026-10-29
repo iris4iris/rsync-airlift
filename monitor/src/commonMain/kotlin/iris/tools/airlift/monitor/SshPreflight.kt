@@ -21,7 +21,9 @@ internal suspend fun checkSshConnection(
             "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"))
         config.identityFile?.let { addAll(listOf("-i", it.absolutePath().toString())) }
     }
-    fun strict() = authenticate(base + listOf("-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", config.host, "true"))
+    // OpenSSH keeps the first value of an option: Airlift's options come first, then the user's --ssh options.
+    fun strict() = authenticate(base + listOf("-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes") + config.sshArguments +
+        listOf(config.host, "true"))
     val first = execute(strict(), false)
     if (first.exitCode == 0) return
     var failure = first
@@ -32,7 +34,7 @@ internal suspend fun checkSshConnection(
         println("SSH host key is unknown for ${config.host}. Review the fingerprint below; enter yes to save it, or no to cancel.")
         // OpenSSH displays the fingerprint and writes to its configured known_hosts.
         val prompt = base + listOf("-o", "BatchMode=no", "-o", "StrictHostKeyChecking=ask",
-            "-o", "PreferredAuthentications=none", "-o", "NumberOfPasswordPrompts=0", config.host, "true")
+            "-o", "PreferredAuthentications=none", "-o", "NumberOfPasswordPrompts=0") + config.sshArguments + listOf(config.host, "true")
         execute(prompt, true)
         // Authentication failure in the trust-only invocation is expected.
         failure = execute(strict(), false)

@@ -247,7 +247,8 @@ Other build targets:
 
 Builds, tests and the terminal/demo UI work on Windows. Real transfers target
 **Linux or WSL with a Linux JDK**, with OpenSSH and rsync on both machines.
-Remote discovery also requires a POSIX shell and GNU `find`.
+Remote discovery also requires a POSIX `sh` and GNU `find` on the source host; the login
+shell may be bash, zsh, fish or tcsh.
 Password authentication requires `sshpass` on the machine running Airlift.
 
 ## Quick start
@@ -283,10 +284,12 @@ modes do not ask for transfer confirmation.
 
 | Argument | Behavior/default |
 | --- | --- |
-| `--workers N` | Initial target concurrency; 16 for real transfers, 4 for demo |
+| `--workers N` | Initial target concurrency, 1–256; 16 for real transfers, 4 for demo |
 | `--rsync "OPTIONS"` | Copy options passed to rsync; no archive/partial/bandwidth policy is injected |
+| `--ssh "OPTIONS"` | Extra OpenSSH client options, such as a cipher; see [Rsync options](#rsync-options) |
+| `--attempts N` | rsync attempts per job, 1–10; 1 |
 | `--batch-min-size SIZE` | Minimum accumulated job size; `5MiB` |
-| `--files FILE` | UTF-8 relative file list; one path per line |
+| `--files FILE` | UTF-8 relative file list; one path per line (a BOM and leading `./` are accepted) |
 | `--null` | Read the list as NUL-separated paths instead |
 | `--port N` | SSH port; 22 |
 | `--identity FILE` | SSH private-key path |
@@ -305,10 +308,12 @@ includes one failure, and gives each run a temporary endpoint by default.
 
 ## SSH authentication
 
-Worker connections open in waves of at most five. Every connection attempt in a
-wave must finish before the next wave starts; connected workers can already
-transfer files. Workers added during a run use the same ordering. This limits
-simultaneous SSH handshakes but does not guarantee acceptance by every server.
+Worker connections open in waves of at most five (`AirliftConfig.connectConcurrency`).
+Every first connection attempt in a wave must finish before the next wave starts;
+connected workers can already transfer files. Workers added during a run use the
+same ordering. Retries and reconnects never run more than five handshakes at once
+either. This keeps startup below OpenSSH's default `MaxStartups 10` but does not
+guarantee acceptance by every server.
 
 Authentication is prepared once before opening the monitor:
 
@@ -330,9 +335,17 @@ fingerprint prompt. Changed host keys remain an error; Airlift does not silently
 replace them. For a headless run, establish the trusted host key beforehand.
 
 Each worker owns an independent SSH ControlMaster and reuses it across jobs.
-Initial connection failures appear in the worker/error views. Failed connections
-are not automatically reconnected; rsync attempts use `AirliftConfig.maxAttempts`
-(default 1). The CLI does not expose a retry-count option.
+
+A worker retries a failed connection with backoff (1 s, 2 s, ...) and gives up
+after 3 consecutive failures (`AirliftConfig.connectAttempts`). After a failed rsync
+attempt the worker asks its ControlMaster whether it is still alive (`ssh -O check`).
+If the connection is gone, for example after a network outage longer than the
+90 s keepalive window, the job returns to the front of the queue instead of being
+marked failed, and the worker reconnects. A completed job resets the failure count.
+Without this check, a worker with a dead master would fail every remaining job
+within milliseconds. Connection problems appear in the worker and error views.
+
+rsync attempts per job use `AirliftConfig.maxAttempts` (CLI `--attempts`, default 1).
 
 ## File selection and destination paths
 
@@ -351,8 +364,23 @@ java -jar rsync-airlift.jar --rsync "-av --partial" \
   /srv/source/*.bin user@host:/srv/destination/
 ```
 
-`*` and `?` match within one path component, `**` crosses directories, and bracket
-classes such as `[abc]` are supported. Quote masks when Airlift should expand them.
+`*` and `?` match within one path component, including names that start with a dot;
+`**` crosses directories; `[abc]`, `[a-z]` and `[!abc]` match one character. A backslash
+escapes the next character (`\*`, `\?`, `\[`, `\\`). A mask ending in `/` selects every
+file below the matching directories, for example `'user@host:/srv/*/data/'`. Quote masks
+when Airlift should expand them.
+
+A path that exists is always used literally, so names containing `[`, `?` or `*`, such as
+`Photos [2020]/`, need no escaping. A mask or source that selects no files stops
+preparation with an error; a mask that also matches directories prints a warning,
+because masks select files.
+
+A source that is a symlink to a directory is followed only when written with a trailing
+slash (`link/`), as in rsync; without it the link itself is copied.
+
+Names that are not valid UTF-8 cannot be passed in rsync's file list: discovery skips
+them with a warning that lists the escaped paths (`\xFF`), and their directories are never
+collapsed. Entries that disappear during discovery are ignored.
 
 With `--files` and no mask, only the listed paths are selected. With a mask and
 `--files`, the two selections are combined without duplicates. List paths are
@@ -367,6 +395,7 @@ Destination mapping:
 | Single file `/data/one/a.bin` | `/backup/a.bin` |
 | Multiple directories `/data/one` and `/data/two` | `/backup/one/...` and `/backup/two/...` |
 | Multiple directories `/data/one/` and `/data/two/` | Their contents directly under `/backup/` |
+| Multiple sources including `.`, `..` or `/data/one/.` | Contents directly under `/backup/`, as with a trailing slash |
 
 A single directory is treated as a root and copies its contents, with or without
 a trailing slash. The directory-name distinction in the table applies to multiple
@@ -377,7 +406,8 @@ sources mapping to the same destination path cause a preparation error.
 ## Scheduling, batching and directory collapse
 
 The launcher starts with descending file sizes (ties by path). When it reaches
-files smaller than `--batch-min-size`, it sorts the remaining tail by path.
+files smaller than `--batch-min-size`, it sorts the remaining tail by source root, then
+path, so files from the same source share batches.
 It fills jobs until their accumulated size reaches the threshold or more, the
 queue ends, or the source root changes. A large file naturally fills a job on its
 own in the descending-size prefix. The final job may be smaller; there is no
@@ -402,9 +432,12 @@ Unselected empty directories and special filesystem entries also block parent
 collapse. Airlift performs no per-job directory rescan or additional SSH check;
 rsync handles the subsequent traversal. Collapsed jobs add `--recursive`.
 
-Collapse is disabled for `--delete*`, `--remove-source-files`, `--copy-links`,
-`--copy-dirlinks`, `--keep-dirlinks`, their recognized short link-following flags,
-and `--no-recursive`. Original file names and sizes remain in the job ledger.
+Collapse is disabled for `--delete*`, `--del`, `--remove-source-files`/`--remove-sent-files`,
+`--copy-links`, `--copy-dirlinks`, `--copy-unsafe-links`, `--keep-dirlinks`, the short
+link-following flags `-L`, `-k`, `-K`, `--no-recursive`, and filter or file-system options
+(`--exclude*`, `--include*`, `--filter`/`-f`, `-F`, `-C`/`--cvs-exclude`,
+`-x`/`--one-file-system`), because recursion could then copy, delete or skip files other
+than the listed ones. Original file names and sizes remain in the job ledger.
 New files found by rsync in a collapsed directory can be copied; files removed
 since startup may no longer be copied. Displayed counts/totals describe the
 initial selection. Keep directory membership stable when that exact selection
@@ -415,6 +448,12 @@ unconfirmed individual outcomes: all its files are conservatively counted as
 failed even if some were copied. A retry reruns the whole batch; rsync reconciles
 the destination according to the supplied options. Pause and concurrency reduction
 take effect between jobs, without interrupting active transfers.
+
+rsync exit code 24 ("some files vanished before they could be transferred") completes
+the job with a warning, shown in the error view, instead of failing it. When a live
+dataset is pre-copied, temporary files routinely disappear between discovery and
+transfer, and one vanished file would otherwise mark a whole batch as failed. Other
+partial-transfer codes, such as 23, still fail the job.
 
 ## Rsync options
 
@@ -430,9 +469,31 @@ a shell. No variable, command-substitution or wildcard expansion takes place in
 `--partial`, `--partial-dir`, `--inplace`, or bandwidth limits.
 
 Airlift appends its relative-path, file-list, SSH transport and telemetry arguments,
-including a filename output format. `-e`/`--rsh`, `--files-from` and an option
-terminator inside `--rsync` are reserved. Use Airlift's `--port`, `--identity`, and
-`--files` for those purposes. Other options are forwarded, not comprehensively validated.
+including a filename output format and `--no-human-readable`. With the latter, `-h` in
+`--rsync` cannot hide progress or `--stats` byte counts from the monitor; it only
+changes rsync's own number formatting, which Airlift does not display.
+
+Some options are reserved inside `--rsync` and rejected:
+- `-e`/`--rsh`, including `-e` inside a short-option cluster such as `-ave ssh`;
+- `--files-from`;
+- options that would read Airlift's file list from standard input: `--exclude-from=-`,
+  `--include-from=-`, and `--filter`/`-f` merge rules that read `-`;
+- an option terminator `--`, and any argument that is not an option or an option's value,
+  since it would become an extra rsync source.
+
+Use Airlift's `--port`, `--identity`, `--ssh` and `--files` for those purposes. Write
+option values as `--option=value` when in doubt. Other options are forwarded, not
+comprehensively validated.
+
+Extra OpenSSH client options go in `--ssh`, for example a faster cipher on a
+CPU-bound link: `--ssh "-c aes128-gcm@openssh.com -o Compression=no"`. They apply to
+every SSH command Airlift runs, after Airlift's own options; OpenSSH keeps the first
+value of an option, so Airlift's transport settings always take precedence. Options
+that would break the worker ControlMasters are rejected: `-M`, `-S`, `-O`, `-N`, `-f`,
+`-n`, `-T`, `-t`, `-W`, `-w`, forwardings (`-L`, `-R`, `-D`), `-G`, `-Q`, `-V`, `-s`,
+`-p` and `-i` (use `--port` and `--identity`), as well as `-o ControlMaster`,
+`ControlPath`, `ControlPersist`, `RemoteCommand`, `RequestTTY`, `SessionType`,
+`StdinNull`, `ForkAfterAuthentication` and forwarding or tunnel options.
 
 `--bwlimit` is **per rsync process**, not global. `-H` can preserve hard links
 within a job, but not across separate jobs. Symlink copying follows the options
@@ -465,10 +526,10 @@ wide, and page when necessary. The overall bar has at most **100** interior cell
 | Left/Right | Move between worker columns |
 | F2, Enter | Toggle details; displayed when height is at least 22 |
 | `P` | Pause/resume assignment of new jobs |
-| `+` / `=` | Increase concurrency by one, or cancel one pending retirement |
+| `+` / `=` | Increase concurrency by one (at most 256), or cancel one pending retirement |
 | `-` | First dismiss one FAILED worker row; otherwise decrease concurrency, minimum one |
 | Click worker/list row or tab | Select an entry or switch view |
-| Mouse wheel over the list | Move selection by three entries |
+| Mouse wheel over the list | Move selection by one entry |
 | `Q` | Detach while running; after completion, exit an owned interactive run. An attached panel only detaches |
 
 Dismissed FAILED rows are hidden in that panel session; their errors remain in
@@ -476,6 +537,11 @@ Errors. They can reappear after reattaching. STOPPED workers are hidden. A subdu
 orange background on the last live rows indicates how many retirements are pending;
 the first workers to finish actually retire. During a run, `Workers` shows the live
 count; after completion it shows the last configured target.
+
+Keys and mouse input apply immediately; the panel fetches a new snapshot about every
+200 ms. The selection stays on the same job or worker when the list changes. Command
+errors appear above the shortcut line and clear after the next successful command or
+about 5 seconds.
 
 Mouse reporting can prevent ordinary text selection. In terminals supporting it,
 hold Shift while selecting to bypass application mouse capture. Fonts, palette,
@@ -489,6 +555,12 @@ The overall bar reserves the full size of active jobs: green shows processed dat
 awaiting final statistics, and orange shows their remaining work. Queued work is
 blank. Confirmed matched data stays cyan; confirmed new data is green and failed
 jobs are red. The Matched/New counters include only confirmed statistics.
+
+Errors (`3`) lists failed jobs, then SSH worker problems, then warnings of successful
+jobs (for example rsync code 24, source files vanished) in yellow. Warnings are never
+counted as failures: the summary adds `Warnings N`, DETAILS shows `Warning:`, and a run
+with warnings but no failures ends as FINISHED WITH WARNINGS. A reconnecting worker's
+message is shown as a warning.
 
 A worker at 100% can still be waiting for rsync to finish. Its bar shows a quiet
 `finishing` label and DETAILS shows `FINISHING`; ETA is blank. The task remains
@@ -555,7 +627,9 @@ java -jar rsync-airlift.jar --attach "$HOME/airlift.connection"
 ```
 
 For an interactive launch that should survive SSH logout, use tmux or a service.
-`Q` alone does not protect the hosting process from logout. The server remains
+Without tmux, logout (SIGHUP) stops the dispatcher cleanly, like Ctrl+C or SIGTERM:
+transfers are cancelled and the connection file is removed. A `nohup` launch keeps
+ignoring SIGHUP. `Q` alone does not protect the hosting process from logout. The server remains
 alive after transfer completion so results can be inspected; **Ctrl+C stops it**.
 For an ordinary interactive run, Q after completion closes both the panel and its
 service. Q during transfer only detaches; a separately attached panel never stops
@@ -563,22 +637,29 @@ the dispatcher.
 The CLI is not currently a one-shot command that exits at the end of copying.
 
 The monitor service binds to **127.0.0.1** on an ephemeral port. Its connection
-file contains the port, token and endpoint descriptions, with owner-only permissions
-on POSIX. Treat it as a credential and keep it out of Git. To attach remotely,
+file contains the port, a 256-bit token and endpoint descriptions. It is created
+exclusively, without following links, and is readable only by its owner: mode 0600
+on POSIX, and an ACL for the current user on Windows (best effort; file systems
+without ACLs keep default permissions). Treat it as a credential and keep it out of Git. To attach remotely,
 run the attach command through SSH on the dispatcher host, with a PTY.
 
 Connection files are never overwritten. If one exists, attach to that dispatcher
 or choose a different `--endpoint`. After an unclean termination, remove a stale
 file only after confirming that its dispatcher is no longer running. Normal
-shutdown removes the connection file. The protocol is version **3**; update
+shutdown removes the connection file. The protocol is version **4**; update
 dispatcher and attached monitors together when the protocol changes.
+
+If the dispatcher becomes unreachable, an attached panel keeps the last data, shows
+`Connection lost, retrying...` and exits with the error after 10 seconds without a
+successful refresh.
 
 ## Midnight Commander
 
 MC shell-link paths are recognized automatically:
 `/sh://user@host/home/data` becomes `user@host:/home/data`.
 `--mc` is accepted but not required. Use `--port` for a nonstandard SSH port rather
-than embedding it in the MC shell-link host.
+than embedding it in the MC shell-link host. Directory names containing `[`, `?` or `*`
+are used literally.
 
 Add to `~/.config/mc/menu`, adjusting the absolute JAR path:
 
@@ -624,8 +705,11 @@ Owners always call `close()` to terminate/reap the child and release its pipes.
 Cancelling pipe I/O aborts the child so a blocked OS read/write can be released.
 Environment values are excluded from specification descriptions.
 
-`JvmProcessLauncher` implements startup and blocking pipe I/O on `Dispatchers.IO`
-and waits through Java's `Process.onExit()`. Its cleanup is idempotent, including
+`JvmProcessLauncher` implements startup and blocking pipe I/O on its own elastic view of
+`Dispatchers.IO` and waits through Java's `Process.onExit()`. A blocked pipe read holds a
+thread until the child writes, so with many workers the 64-thread `Dispatchers.IO`
+limit could park every thread in a read while the writes feeding those children
+waited in the queue; the separate pool removes that deadlock. Its cleanup is idempotent, including
 concurrent close calls. The common SSH session streams input and output
 concurrently to avoid deadlocks on large file lists; it parses CR/LF records even
 when UTF-8 characters span input chunks. It does not create threads or use Java
@@ -697,7 +781,12 @@ runBlocking {
 
 Direction defaults to DOWNLOAD; UPLOAD reverses the configured roots. `path` and
 `files` are relative POSIX paths without traversal; batch `size` is the total
-source size. An empty `files` list means one file at `path`. Task IDs must be
+source size. An empty `files` list means one file at `path`; `fileTotal` defaults to
+the list size and lets a monitor copy of a job carry the count without the list.
+A job that rsync finishes with code 24 succeeds with `TaskState.warning` set. A custom
+`TransferSession` can implement `isConnected()` so that a job failed by a dropped
+connection is requeued and the worker reconnects; the default reports a live
+connection. Task IDs must be
 unique (default: `path`); callers must avoid overlapping destinations, including
 symlink aliases. `sourceRoot` can override a job's source root. `entries` can
 provide a shortened file/directory list while `files` retains the accounting list;
@@ -742,12 +831,15 @@ Service lifetime uses coroutine completion/cancellation; the JVM entry point onl
 bridges main/runBlocking, stderr and process exit. JVM adapters provide the
 socket service/client, shutdown-hook registration and temporary directories.
 
-The monitor client/server and protocol-3 codec live in common code. The server
-uses two coroutine handlers and a bounded queue of 16 waiting connections.
+The monitor client/server and protocol-4 codec live in common code. The server
+serves each connection in its own coroutine, at most 8 at a time, and closes further
+connections immediately. A request (version, token, command) must arrive within
+5 seconds and the response must complete within 30 seconds.
 JVM adapters provide loopback sockets with connect/read timeouts and cancellation
 cleanup; token generation and protected connection-file persistence are separate
-platform functions. Protocol-3 data-stream framing and the properties file format
-remain compatible with existing JVM clients.
+platform functions. Protocol 4 keeps the data-stream framing and properties file
+format but sends each batch's file count instead of its file list; protocol-3
+monitors receive a clear "Monitor protocol changed" message.
 
 Monitor source sets:
 
@@ -821,7 +913,9 @@ Building requires a JDK; running the resulting executable does not.
 Linux core process and system adapters are implemented and its Native test executable
 can be linked. Linux monitor socket, console, inventory and application adapters are
 implemented. A Native ANSI terminal backend supports demo, attach and interactive
-transfers and has been verified on Linux with real SSH/rsync transfers. See [Linux Native](docs/NATIVE.md)
+transfers and has been verified on Linux with real SSH/rsync transfers. If the terminal
+stops reading or disconnects, only the panel closes; transfers continue as a detached
+service that `--attach` can reopen. See [Linux Native](docs/NATIVE.md)
 for build, packaging and usage instructions. Default JVM builds remain available.
 Compilation and linking work on Windows too; the resulting ELF runs on Linux x86-64.
 

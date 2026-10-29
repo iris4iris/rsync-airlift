@@ -36,13 +36,17 @@ private class SshSession(
     private var closed = false
     private var cleaned = false
     private val processes = mutableSetOf<ChildProcess>()
+    private var master: ChildProcess? = null
     private val socket = Path(directory, "s")
+    private val userOptions = config.sshArguments
+    // OpenSSH keeps the first value of an option, so Airlift's options precede the user's --ssh options.
     private val base get() = buildList {
         add(config.sshExecutable)
         addAll(listOf("-p", config.port.toString(), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
             "-o", "ConnectTimeout=${config.connectTimeoutSeconds}", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"))
         config.identityFile?.let { addAll(listOf("-i", paths.absolute(it).toString())) }
     }
+    private fun control(vararg arguments: String) = base + listOf("-S", socket.toString()) + userOptions + arguments
 
     private suspend fun launch(spec: ProcessSpec): ChildProcess {
         // A started process must be registered or closed even if startup races with cancellation.
@@ -60,25 +64,38 @@ private class SshSession(
 
     override suspend fun connect() {
         try {
-            val master = launch(authentication.prepare(spec(base + listOf("-M", "-N", "-S", socket.toString(), "-o", "ControlPersist=no", config.host), Path(directory, "master.log"))))
+            val master = launch(authentication.prepare(spec(control("-M", "-N", "-o", "ControlPersist=no", config.host), Path(directory, "master.log"))))
+            this.master = master
             master.stdin?.close()
             val deadline = clock.monotonicNanos() + (config.connectTimeoutSeconds.toLong() + 2) * 1_000_000_000
             while (clock.monotonicNanos() < deadline) {
-                check(master.exitCode() == null) { "SSH master exited: ${files.readTail(Path(directory, "master.log"), 4096)}" }
-                val probe = launch(spec(base + listOf("-S", socket.toString(), "-O", "check", config.host), Path(directory, "probe.log")))
-                val code = try { probe.stdin?.close(); probe.awaitExit(1000) }
-                    finally { withContext(NonCancellable) { probe.close(); forget(probe) } }
-                if (code == 0) return
+                check(master.exitCode() == null) { "SSH master exited: ${files.readTail(Path(directory, "master.log"), 4096).trim()}" }
+                if (probeMaster(1000)) return
                 delay(100)
             }
             error("SSH ControlMaster connection timed out")
         } catch (e: Throwable) { close(); throw e }
     }
 
+    /** Asks the ControlMaster whether it is still running; never starts a new connection. */
+    private suspend fun probeMaster(timeoutMillis: Long): Boolean {
+        val probe = launch(spec(control("-O", "check", config.host), Path(directory, "probe.log")))
+        val code = try { probe.stdin?.close(); probe.awaitExit(timeoutMillis) }
+            finally { withContext(NonCancellable) { probe.close(); forget(probe) } }
+        return code == 0
+    }
+
+    override suspend fun isConnected(): Boolean {
+        val master = master ?: return false
+        return master.exitCode() == null && probeMaster(5000)
+    }
+
     override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit): Int {
         failureDetails = null
-        files.createDirectories(config.localRoot)
-        val transport = (base + listOf("-S", socket.toString(), "-o", "ControlMaster=no", "-o", "ProxyCommand=false"))
+        // Only a download writes locally; for an upload the local root is a source and may even be a file.
+        if (config.direction == TransferDirection.DOWNLOAD) files.createDirectories(config.localRoot)
+        // ProxyCommand=false: if the master is gone, fail fast instead of opening an unauthenticated connection.
+        val transport = (base + listOf("-S", socket.toString(), "-o", "ControlMaster=no", "-o", "ProxyCommand=false") + userOptions)
             .joinToString(" ") { quote(it) }
         val address = config.host.substringAfterLast('@')
         val rsyncHost = if (':' in address) config.host.removeSuffix(address) + "[$address]" else config.host
@@ -111,7 +128,7 @@ private class SshSession(
                 }
                 try {
                     val output = requireNotNull(process.stdout)
-                    val parser = RsyncOutputParser(task.files.ifEmpty { listOf(task.path) }.toSet())
+                    val parser = RsyncOutputParser(task.files.ifEmpty { listOf(task.path) })
                     val record = Buffer()
                     val diagnostics = RsyncDiagnostics()
                     suspend fun consumeRecord() {

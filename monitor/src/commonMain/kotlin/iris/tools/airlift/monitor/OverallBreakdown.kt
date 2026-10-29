@@ -28,9 +28,11 @@ data class OverallBreakdown(
     }
 
     companion object {
-        fun from(snapshot: AirliftSnapshot): OverallBreakdown {
-            val totalSize = snapshot.tasks.sumOf { it.task.size ?: 0 }.toDouble()
-            val byBytes = totalSize > 0 && snapshot.tasks.all { it.task.size != null }
+        fun from(snapshot: AirliftSnapshot): OverallBreakdown = from(snapshot, MonitorStats.of(snapshot))
+
+        internal fun from(snapshot: AirliftSnapshot, stats: MonitorStats): OverallBreakdown {
+            val totalSize = stats.totalBytes.toDouble()
+            val byBytes = totalSize > 0 && stats.allSizesKnown
             val denominator = if (byBytes) totalSize else snapshot.tasks.size.toDouble().coerceAtLeast(1.0)
             var matched = 0.0
             var literal = 0.0
@@ -53,7 +55,7 @@ data class OverallBreakdown(
                 val rawMatched = task.progress?.matchedBytes
                 val l = task.progress?.literalBytes
                 if (rawMatched == null || l == null || rawMatched < 0 || l < 0) continue
-                val m = if (task.task.files.isNotEmpty() && task.task.size != null)
+                val m = if (task.task.isBatch && task.task.size != null)
                     rawMatched + (requireNotNull(task.task.size) - rawMatched - l).coerceAtLeast(0) else rawMatched
                 // UI Matched includes successful files requiring no data transfer;
                 // this describes avoided transfer, not a checksum verification.
@@ -72,7 +74,7 @@ data class OverallBreakdown(
                 matched += weight * m / divisor
                 literal += weight * l / divisor
             }
-            val processed = MonitorModel.overallProgress(snapshot)
+            val processed = stats.progress
             // Green includes logical progress awaiting final Matched/New statistics.
             // Orange reserves the still-unprocessed part of all active jobs.
             val processing = (processed - matched - literal - failed).coerceAtLeast(0.0)

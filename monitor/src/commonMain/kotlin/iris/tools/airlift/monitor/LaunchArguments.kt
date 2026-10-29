@@ -1,5 +1,8 @@
 package iris.tools.airlift.monitor
 
+import iris.tools.airlift.AirliftConfig
+import iris.tools.airlift.RsyncArguments
+import iris.tools.airlift.SshOptions
 import iris.tools.airlift.TransferDirection
 
 internal data class TransferRoots(val host: String, val remoteRoot: String, val localRoot: String, val direction: TransferDirection) {
@@ -33,10 +36,23 @@ internal data class TransferRoots(val host: String, val remoteRoot: String, val 
 }
 
 internal data class LaunchArguments(val options: Map<String, String>, val enabled: Set<String>, val paths: List<String>) {
+    val workers: Int? get() = number("--workers")
+    val port: Int? get() = number("--port")
+    val attempts: Int? get() = number("--attempts")
+
+    private fun number(name: String): Int? = options[name]?.let { value ->
+        val range = numberRanges.getValue(name)
+        value.toIntOrNull()?.takeIf { it in range }
+            ?: throw IllegalArgumentException("$name must be a whole number from ${range.first} to ${range.last}, not '$value'")
+    }
+
     companion object {
+        private val numberRanges = mapOf("--workers" to 1..AirliftConfig.MAX_WORKERS, "--port" to 1..65535, "--attempts" to 1..10)
+
         fun parse(args: List<String>): LaunchArguments {
             val flags = setOf("--demo", "--serve-demo", "--serve", "--run", "--null", "--swing", "--yes", "--mc")
-            val names = setOf("--attach", "--endpoint", "--files", "--workers", "--port", "--identity", "--rsync", "--batch-min-size")
+            val names = setOf("--attach", "--endpoint", "--files", "--workers", "--port", "--identity", "--rsync", "--batch-min-size",
+                "--ssh", "--attempts")
             val options = mutableMapOf<String, String>()
             val enabled = mutableSetOf<String>()
             val paths = mutableListOf<String>()
@@ -66,7 +82,10 @@ internal data class LaunchArguments(val options: Map<String, String>, val enable
                 require("--swing" !in enabled || enabled.any { it in setOf("--demo", "--run") }) { "--swing requires an interactive mode" }
             }
             options["--batch-min-size"]?.let(::batchSize)
-            return LaunchArguments(options, enabled, paths.map(::normalizeEndpoint))
+            options["--rsync"]?.let(RsyncArguments::parse)
+            options["--ssh"]?.let(SshOptions::parse)
+            // Report malformed numbers before confirmation, SSH or discovery start.
+            return LaunchArguments(options, enabled, paths.map(::normalizeEndpoint)).also { listOf(it.workers, it.port, it.attempts) }
         }
     }
 }

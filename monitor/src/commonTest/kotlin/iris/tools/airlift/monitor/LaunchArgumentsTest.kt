@@ -1,5 +1,6 @@
 package iris.tools.airlift.monitor
 
+import iris.tools.airlift.AirliftConfig
 import iris.tools.airlift.TransferDirection
 import kotlin.test.*
 
@@ -30,6 +31,23 @@ class LaunchArgumentsTest {
         assertEquals(setOf("--serve"), LaunchArguments.parse(listOf("--serve", "--files", "list", "/local", "user@host:/remote")).enabled)
         assertEquals(setOf("--demo"), LaunchArguments.parse(listOf("--demo")).enabled)
         assertTrue("--attach" in LaunchArguments.parse(listOf("--attach", "file", "--swing")).options)
+    }
+
+    @Test fun `ssh options attempts and numeric limits are validated with friendly errors`() {
+        val args = LaunchArguments.parse(listOf("--ssh", "-o Compression=no", "--attempts", "3", "--workers=256", "--port", "2222",
+            "user@host:/data/", "/backup/"))
+        assertEquals("-o Compression=no", args.options["--ssh"])
+        assertEquals(3, args.attempts)
+        assertEquals(256, args.workers)
+        assertEquals(2222, args.port)
+        val failures = mapOf(listOf("--workers", "0") to "--workers must be a whole number from 1 to ${AirliftConfig.MAX_WORKERS}",
+            listOf("--workers", "many") to "not 'many'", listOf("--workers", "257") to "1 to 256",
+            listOf("--port", "70000") to "--port must be a whole number from 1 to 65535", listOf("--attempts", "11") to "1 to 10",
+            listOf("--ssh", "-p 22") to "managed by Airlift", listOf("--rsync", "-av --rsh=ssh") to "Airlift manages")
+        for ((options, message) in failures) {
+            val error = assertFailsWith<IllegalArgumentException> { LaunchArguments.parse(options + listOf("user@host:/data/", "/backup/")) }
+            assertContains(error.message.orEmpty(), message)
+        }
     }
 
     @Test fun `reject ambiguous endpoints and obsolete direction flags before starting transfers`() {

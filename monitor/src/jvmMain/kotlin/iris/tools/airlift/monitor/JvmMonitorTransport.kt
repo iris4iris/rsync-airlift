@@ -12,7 +12,7 @@ private suspend fun <T> socketIo(close: () -> Unit, discard: (T) -> Unit = {}, o
             try {
                 val result = operation()
                 continuation.resume(result, onCancellation = { _, value, _ -> discard(value) })
-            } catch (error: Exception) { continuation.resumeWithException(error) }
+            } catch (error: Throwable) { continuation.resumeWithException(error) } // Never leave the caller suspended.
         }
         continuation.invokeOnCancellation { close(); task.cancel() }
     }

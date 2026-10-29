@@ -9,6 +9,9 @@ import platform.posix.*
 import iris.tools.airlift.monitor.posix.*
 
 fun main(args: Array<String>) = runBlocking {
+    // A closed stdout/stderr pipe (| head, a dead log reader) must surface as EPIPE, not kill the dispatcher
+    // and orphan its SSH masters. Spawned children get the default disposition back before exec.
+    airlift_ignore_sigpipe()
     var status = 0
     try {
         if (args.isNotEmpty() && "--help" !in args) {
@@ -29,9 +32,12 @@ internal actual fun monitorApplicationPlatform(): MonitorApplicationPlatform = o
         val server = MonitorServer(source, endpoint)
         return object : MonitorService { override fun close() = server.close() }
     }
+    /** SIGINT, SIGTERM and SIGHUP (unless ignored at launch, e.g. by nohup) run [action] once, like JVM shutdown hooks. */
     override fun onShutdown(action: suspend () -> Unit): ShutdownRegistration {
         val signals = airlift_install_signals() ?: linuxError("install signal handlers")
-        val scope = CoroutineScope(SupervisorJob() + preparationDispatcher())
+        // An uncaught exception would abort a Native process; report it instead, as a JVM hook thread does.
+        val reporter = CoroutineExceptionHandler { _, error -> fputs("Airlift: shutdown failed: ${error.message}\n", stderr) }
+        val scope = CoroutineScope(SupervisorJob() + preparationDispatcher() + reporter)
         val job = scope.launch {
             while (airlift_stopping() == 0) delay(50)
             withContext(NonCancellable) { action() }

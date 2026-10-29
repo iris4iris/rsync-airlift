@@ -42,6 +42,33 @@ class MultipleSourcesTest {
         } finally { root.toFile().deleteRecursively() }
     }
 
+    @Test fun `several files from one directory give a directory upload root and literal bracket names`() = kotlinx.coroutines.test.runTest {
+        val root = Files.createTempDirectory("airlift-multi-")
+        try {
+            val a = root.resolve("a.bin")
+            val b = root.resolve("b[1].bin")
+            Files.write(a, ByteArray(2)); Files.write(b, ByteArray(3)); Files.write(root.resolve("b1.bin"), ByteArray(9))
+            val plan = plan(listOf(a.toString(), b.toString(), "user@host:/dst/"))
+            assertEquals(root.toPortablePath(), plan.config.localRoot)
+            assertTrue(Files.isDirectory(Path.of(plan.config.localRoot.toString())))
+            assertEquals(listOf("b[1].bin" to 3L, "a.bin" to 2L), plan.tasks.map { it.path to it.size })
+        } finally { root.toFile().deleteRecursively() }
+    }
+
+    @Test fun `dot sources copy contents and masks without matches fail`() = kotlinx.coroutines.test.runTest {
+        val root = Files.createTempDirectory("airlift-multi-")
+        try {
+            val a = Files.createDirectories(root.resolve("one"))
+            val b = Files.createDirectories(root.resolve("two"))
+            Files.write(a.resolve("x"), ByteArray(2)); Files.write(b.resolve("y"), ByteArray(3))
+            val plan = plan(listOf("$a/.", "$b/sub/..", b.toString(), "user@host:/dest/"))
+            assertEquals(setOf("x", "y", "two/y"), plan.tasks.map { it.path }.toSet())
+            assertEquals(a.toString().replace('\\', '/'), plan.tasks.single { it.path == "x" }.sourceRoot)
+            val failure = assertFailsWith<IllegalArgumentException> { plan(listOf("$a/*.none", b.toString(), "user@host:/dest/")) }
+            assertContains(failure.message.orEmpty(), "matched no files")
+        } finally { root.toFile().deleteRecursively() }
+    }
+
     @Test fun `remote sources require one host and one direction`() = kotlinx.coroutines.test.runTest {
         assertEquals(2, TransferRoots.parseSources(listOf("user@host:/one", "user@host:/two", "/dest")).size)
         assertFailsWith<IllegalArgumentException> { TransferRoots.parseSources(listOf("user@host:/one", "user@other:/two", "/dest")) }

@@ -32,19 +32,21 @@ class MonitorTransportTest {
                         verify(DataInputStream(socket.getInputStream()))
                     }
                 }
-                request(3, properties.getProperty("token")) { input ->
+                assertEquals("4", properties.getProperty("protocol"))
+                request(4, properties.getProperty("token")) { input ->
                     assertTrue(input.readBoolean())
                     assertFalse(input.readBoolean()); assertFalse(input.readBoolean())
                     assertEquals(7, input.readInt())
                     assertFalse(input.readBoolean()); assertFalse(input.readBoolean())
                     assertEquals(0, input.readInt()); assertEquals(0, input.readInt())
                 }
-                request(2, properties.getProperty("token")) { input ->
+                // A protocol-3 client receives a readable explanation instead of undecodable data.
+                request(3, properties.getProperty("token")) { input ->
                     assertFalse(input.readBoolean())
                     val size = input.readInt()
                     assertContains(String(input.readNBytes(size), Charsets.UTF_8), "protocol changed")
                 }
-                request(3, "wrong-token") { assertEquals(-1, it.read()) }
+                request(4, "wrong-token") { assertEquals(-1, it.read()) }
             }
         } finally { Files.deleteIfExists(endpoint); Files.delete(directory) }
     }

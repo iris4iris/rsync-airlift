@@ -92,7 +92,8 @@ class AirliftDispatcherTest {
     @Test fun `new workers wait for current wave including failed connection attempts`() = runTest {
         val gates = (1..8).associateWith { CompletableDeferred<Unit>() }
         val started = mutableListOf<Int>()
-        val dispatcher = engine((1..10).map { TransferTask("file-$it") }, settings(workers = 5),
+        // One attempt: a failed first connection ends the worker instead of retrying after a backoff.
+        val dispatcher = engine((1..10).map { TransferTask("file-$it") }, settings(workers = 5).copy(connectAttempts = 1),
             factory = TransferSessionFactory { id ->
                 object : TransferSession {
                     override suspend fun connect() { started.add(id); gates.getValue(id).await() }
@@ -115,6 +116,30 @@ class AirliftDispatcherTest {
             assertEquals((1..8).toList(), started)
         } finally { dispatcher.close() }
         assertTrue(dispatcher.awaitCompletion().cancelled)
+    }
+
+    @Test fun `a retry backoff does not hold up the next connection wave`() = runTest {
+        val attempts = mutableListOf<Pair<Int, Long>>()
+        val dispatcher = engine((1..12).map { TransferTask("file-$it") }, settings(workers = 6), factory = TransferSessionFactory { id ->
+            object : TransferSession {
+                override suspend fun connect() {
+                    val first = attempts.none { it.first == id }
+                    attempts.add(id to testScheduler.currentTime)
+                    if (id == 1 && first) error("Connection refused")
+                }
+                override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit): Int { delay(5000); return 0 }
+                override suspend fun close() {}
+            }
+        })
+        try {
+            dispatcher.start()
+            runCurrent()
+            // Worker 6 (second wave) starts as soon as the first wave's first attempts finish.
+            assertEquals(0L, attempts.single { it.first == 6 }.second)
+            advanceTimeBy(1001)
+            assertEquals(listOf(0L, 1000L), attempts.filter { it.first == 1 }.map { it.second })
+            assertEquals(12, dispatcher.awaitCompletion().completed)
+        } finally { dispatcher.close() }
     }
 
     @Test fun `source and destination descriptions belong to the shared dispatcher`() = runTest {
@@ -268,7 +293,7 @@ class AirliftDispatcherTest {
         } finally { gates.values.forEach { it.complete(Unit) }; cleanup.complete(Unit); dispatcher.close() }
     }
 
-    @Test fun `connection failures finish without respawn loops`() = runTest {
+    @Test fun `connection failures retry with backoff and finish without respawn loops`() = runTest {
         var created = 0
         val dispatcher = engine(listOf(TransferTask("a")), settings(1), factory = TransferSessionFactory {
             created++
@@ -281,9 +306,144 @@ class AirliftDispatcherTest {
         try {
             dispatcher.start()
             val final = dispatcher.awaitCompletion()
-            assertEquals(1, created)
+            assertEquals(3, created)
+            assertEquals(3000, testScheduler.currentTime) // 1 s, then 2 s backoff
             assertEquals(1, final.failed)
             assertEquals("Cannot connect", final.workers.single().error)
+            assertEquals(WorkerStatus.FAILED, final.workers.single().status)
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `a single connection attempt keeps the old fail-fast behavior`() = runTest {
+        var created = 0
+        val dispatcher = engine(listOf(TransferTask("a")), settings(1).copy(connectAttempts = 1), factory = TransferSessionFactory {
+            created++
+            object : TransferSession {
+                override suspend fun connect() { error("Cannot connect") }
+                override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit) = 0
+                override suspend fun close() {}
+            }
+        })
+        try {
+            dispatcher.start()
+            assertEquals(1, dispatcher.awaitCompletion().failed)
+            assertEquals(1, created)
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `a lost connection returns the job to the queue and the worker reconnects`() = runTest {
+        val logs = Logs()
+        var connections = 0
+        val transferred = mutableListOf<Pair<Int, String>>()
+        val dispatcher = engine((1..4).map { TransferTask("$it", 10) }, settings(1), logs, TransferSessionFactory {
+            val connection = ++connections
+            object : TransferSession {
+                var alive = true
+                override suspend fun connect() {}
+                override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit): Int {
+                    transferred.add(connection to task.id)
+                    // The first connection dies while running job 2: rsync exits 255 in milliseconds.
+                    if (connection == 1 && task.id == "2") { alive = false; return 255 }
+                    return if (alive) 0 else 255
+                }
+                override suspend fun isConnected() = alive
+                override suspend fun close() {}
+            }
+        })
+        try {
+            dispatcher.start()
+            val final = dispatcher.awaitCompletion()
+            assertEquals(4, final.completed)
+            assertEquals(0, final.failed)
+            assertEquals(2, connections)
+            assertEquals(listOf(1 to "1", 1 to "2", 2 to "2", 2 to "3", 2 to "4"), transferred)
+            val retried = final.tasks.single { it.task.id == "2" }
+            assertEquals(2, retried.attempts)
+            assertNull(retried.error)
+            assertContains(logs.attempts, "worker-1-task-1-attempt-2.log")
+            assertEquals(WorkerStatus.FINISHED, final.workers.single().status)
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `a connection that keeps dying fails the worker instead of draining the queue`() = runTest {
+        var connections = 0
+        var transfers = 0
+        val dispatcher = engine((1..50).map { TransferTask("$it", 10) }, settings(1), factory = TransferSessionFactory {
+            connections++
+            object : TransferSession {
+                override suspend fun connect() {}
+                override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit): Int { transfers++; return 255 }
+                override suspend fun isConnected() = false
+                override suspend fun close() {}
+            }
+        })
+        try {
+            dispatcher.start()
+            val final = dispatcher.awaitCompletion()
+            assertEquals(3, connections)
+            assertEquals(3, transfers) // one attempt per connection, not 50 instant failures
+            assertEquals(WorkerStatus.FAILED, final.workers.single().status)
+            assertEquals("SSH connection lost", final.workers.single().error)
+            assertEquals(50, final.failed)
+            assertTrue(final.tasks.all { it.error == "SSH connection lost" || it.error == "No workers available" })
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `ordinary job failures on a live connection do not reconnect`() = runTest {
+        var connections = 0
+        val dispatcher = engine((1..3).map { TransferTask("$it") }, settings(1), factory = TransferSessionFactory {
+            connections++
+            object : TransferSession {
+                override suspend fun connect() {}
+                override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit) = 23
+                override suspend fun isConnected() = true
+                override suspend fun close() {}
+            }
+        })
+        try {
+            dispatcher.start()
+            assertEquals(3, dispatcher.awaitCompletion().failed)
+            assertEquals(1, connections)
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `vanished source files are a warning on a successful job`() = runTest {
+        val dispatcher = engine(listOf(TransferTask("a", 10, files = listOf("a", "b"))), settings(1), factory = factory { _, _ -> 24 })
+        try {
+            dispatcher.start()
+            val final = dispatcher.awaitCompletion()
+            val task = final.tasks.single()
+            assertEquals(TaskStatus.SUCCEEDED, task.status)
+            assertNull(task.error)
+            assertEquals("Some source files vanished before they were copied (code 24).", task.warning)
+            assertEquals(2, final.completed)
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `concurrent SSH logins are limited`() = runTest {
+        var connecting = 0
+        var peak = 0
+        val dispatcher = engine((1..10).map { TransferTask("$it") }, settings(6).copy(connectConcurrency = 2), factory = TransferSessionFactory {
+            object : TransferSession {
+                override suspend fun connect() { connecting++; peak = maxOf(peak, connecting); delay(500); connecting-- }
+                override suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit) = 0
+                override suspend fun close() {}
+            }
+        })
+        try {
+            dispatcher.start()
+            assertEquals(10, dispatcher.awaitCompletion().completed)
+            assertEquals(2, peak)
+        } finally { dispatcher.close() }
+    }
+
+    @Test fun `worker count requests are bounded`() = runTest {
+        val dispatcher = engine(listOf(TransferTask("a")), settings(1), factory = factory { _, _ -> delay(1000); 0 })
+        try {
+            dispatcher.start()
+            assertFailsWith<IllegalArgumentException> { dispatcher.setWorkerCount(0) }
+            assertFailsWith<IllegalArgumentException> { dispatcher.setWorkerCount(AirliftConfig.MAX_WORKERS + 1) }
+            assertEquals(1, dispatcher.awaitCompletion().completed)
         } finally { dispatcher.close() }
     }
 
@@ -300,7 +460,7 @@ class AirliftDispatcherTest {
 
     @Test fun `transport-local connection timeout fails once without respawn`() = runTest {
         var created = 0
-        val dispatcher = engine(listOf(TransferTask("a")), settings(1), factory = TransferSessionFactory {
+        val dispatcher = engine(listOf(TransferTask("a")), settings(1).copy(connectAttempts = 1), factory = TransferSessionFactory {
             created++
             object : TransferSession {
                 override suspend fun connect() { withTimeout(10) { delay(20) } }

@@ -53,6 +53,77 @@ class LinuxAnsiTerminalTest {
         }
     }
 
+    /** A pseudo-terminal nobody reads stands in for a stalled SSH session; runs without a controlling terminal. */
+    private fun withPseudoTerminal(block: (master: Int, terminal: LinuxAnsiTerminal) -> Unit) {
+        val master = posix_openpt(O_RDWR or O_NOCTTY)
+        if (master < 0) return
+        try {
+            assertEquals(0, grantpt(master)); assertEquals(0, unlockpt(master))
+            assertEquals(0, fcntl(master, F_SETFL, fcntl(master, F_GETFL) or O_NONBLOCK))
+            if (getenv("TERM")?.toKString() == "dumb") setenv("TERM", "xterm", 1)
+            val terminal = LinuxAnsiTerminal(requireNotNull(ptsname(master)).toKString())
+            terminal.start()
+            try { block(master, terminal) } finally { terminal.close() }
+        } finally { close(master) }
+    }
+    private fun drainMaster(master: Int): Int {
+        val buffer = ByteArray(65536)
+        var total = 0
+        while (true) {
+            val count = buffer.usePinned { read(master, it.addressOf(0), buffer.size.convert()) }
+            if (count <= 0) return total
+            total += count.toInt()
+        }
+    }
+    private fun busyFrame(index: Int) = MonitorFrame(MonitorSize(200, 60)).apply {
+        repeat(60) { row -> putString(0, row, "frame $index row $row ".repeat(10)) }
+    }
+
+    @Test fun stalledTerminalQueuesOutputWithoutFailingAndCatchesUp() = withPseudoTerminal { master, terminal ->
+        repeat(40) { terminal.present(busyFrame(it)) }
+        assertTrue(terminal.backlog > 0, "the pseudo-terminal buffer should be full")
+        val deadline = monitorMonotonicNanos() + 5_000_000_000L
+        var received = 0
+        while (terminal.backlog > 0 && monitorMonotonicNanos() < deadline) {
+            received += drainMaster(master)
+            terminal.present(busyFrame(1000))
+        }
+        assertEquals(0, terminal.backlog)
+        received += drainMaster(master)
+        assertTrue(received > 10_000)
+        assertNull(terminal.pollEvent())
+    }
+
+    @Test fun hangupEndsPanelInsteadOfThrowing() {
+        val master = posix_openpt(O_RDWR or O_NOCTTY)
+        if (master < 0) return
+        if (getenv("TERM")?.toKString() == "dumb") setenv("TERM", "xterm", 1)
+        assertEquals(0, grantpt(master)); assertEquals(0, unlockpt(master))
+        val terminal = LinuxAnsiTerminal(requireNotNull(ptsname(master)).toKString())
+        try {
+            terminal.start()
+            close(master)
+            terminal.present(busyFrame(1))
+            assertEquals(MonitorEvent.Key(MonitorKey.EOF), terminal.pollEvent())
+            assertEquals(MonitorEvent.Key(MonitorKey.EOF), terminal.pollEvent())
+        } finally { terminal.close() }
+    }
+
+    @Test fun pastedControlCDoesNotStopButTypedControlCDoes() = withPseudoTerminal { master, terminal ->
+        fun type(text: String) { val bytes = text.encodeToByteArray(); bytes.usePinned { write(master, it.addressOf(0), bytes.size.convert()) } }
+        fun nextEvent(): MonitorEvent? {
+            val deadline = monitorMonotonicNanos() + 2_000_000_000L
+            while (monitorMonotonicNanos() < deadline) { terminal.pollEvent()?.let { return it }; usleep(10_000u) }
+            return null
+        }
+        type("\u001b[200~abc\u0003def\u001b[201~x")
+        assertEquals(MonitorEvent.Key(MonitorKey.Character, 'x'), nextEvent())
+        assertEquals(0, airlift_stopping())
+        type("\u0003")
+        assertEquals(MonitorEvent.Key(MonitorKey.EOF), nextEvent())
+        assertNotEquals(0, airlift_stopping())
+    }
+
     @Test fun openingTerminalPreservesPendingServiceShutdown(): Unit = runBlocking {
         if (!hasInteractiveConsole()) return@runBlocking
         val shutdown = CompletableDeferred<Unit>()

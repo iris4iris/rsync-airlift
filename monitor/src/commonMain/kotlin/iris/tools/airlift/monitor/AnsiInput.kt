@@ -4,6 +4,10 @@ package iris.tools.airlift.monitor
 internal class AnsiInput {
     private var pending = ""
     private var pasting = false
+    private var interrupted = false
+
+    /** True once after Ctrl+C was decoded as a key. Bytes inside a bracketed paste never count. */
+    fun takeInterrupt(): Boolean = interrupted.also { interrupted = false }
     fun feed(bytes: ByteArray) {
         pending += bytes.map { (it.toInt() and 255).toChar() }.joinToString("")
         if (pending.length > 65536) {
@@ -30,7 +34,8 @@ internal class AnsiInput {
             if (pending.length < count) return null
             val text = take(count)
             return when (byte) {
-                3, 4 -> MonitorEvent.Key(MonitorKey.EOF)
+                3 -> { interrupted = true; MonitorEvent.Key(MonitorKey.EOF) }
+                4 -> MonitorEvent.Key(MonitorKey.EOF)
                 9 -> MonitorEvent.Key(MonitorKey.Tab)
                 10, 13 -> MonitorEvent.Key(MonitorKey.Enter)
                 in 32..126 -> MonitorEvent.Key(MonitorKey.Character, text[0])

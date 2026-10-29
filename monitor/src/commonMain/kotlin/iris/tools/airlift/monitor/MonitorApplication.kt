@@ -14,14 +14,23 @@ internal suspend fun launchMonitor(args: List<String>, platform: MonitorApplicat
             [options] SOURCE [SOURCE ...] DESTINATION [--files FILE]
                     [--workers N] [--port N] [--identity FILE] [--endpoint FILE] [--swing]
                     [--rsync "-avH --partial --inplace --bwlimit=90000"]
+                    [--ssh "-o Compression=no"] [--attempts N]
             --serve [options] SOURCE DESTINATION  Start transfers without opening TUI
 
-            File list: UTF-8 relative paths, one per line; --null reads NUL-separated paths.
+            --workers N: 1-${AirliftConfig.MAX_WORKERS} (default 16). --attempts N: rsync attempts per job, 1-10 (default 1).
+            --ssh "OPTIONS": extra OpenSSH client options for every connection; port, key,
+            multiplexing and forwarding stay managed by Airlift (use --port and --identity).
+            File list: UTF-8 relative paths, one per line (optional BOM and leading ./);
+            --null reads NUL-separated paths.
             Multiple sources are accepted; the last path is always the destination.
             Quote masks to let Airlift expand them; expanded local file lists also work.
+            An existing path is never expanded; escape literal \*, \? and \[ in masks.
+            * and ? stay within a name (and match leading dots), ** crosses directories,
+            [abc] and [!abc] match one character; a mask ending in / selects whole directories.
             Without --files: discover source files. Mask + --files: union without duplicates.
             With --files and no mask: use only the list. All sizes are collected before copying.
-            Tasks run largest first. Remote discovery requires GNU find over SSH.
+            A mask or source that selects no files is an error.
+            Tasks run largest first. Remote discovery requires a POSIX sh and GNU find over SSH.
             --batch-min-size SIZE fills each rsync job to SIZE or more (default 5MiB; MB is decimal).
             Confirm From/To before real transfers; --yes skips confirmation for automation.
             MC /sh://user@host/path endpoints are recognized automatically (--mc is optional).
@@ -52,13 +61,15 @@ internal suspend fun launchMonitor(args: List<String>, platform: MonitorApplicat
     val roots = allRoots.firstOrNull()
     val initialConfig = if (demo) {
         val root = platform.temporaryDirectory("airlift-demo-")
-        AirliftConfig("demo@localhost", "/demo", root.resolve("files"), workers = options["--workers"]?.toInt() ?: 4, logDirectory = root.resolve("logs"))
+        AirliftConfig("demo@localhost", "/demo", root.resolve("files"), workers = arguments.workers ?: 4,
+            maxAttempts = arguments.attempts ?: 1, logDirectory = root.resolve("logs"))
     } else requireNotNull(roots).let { roots -> AirliftConfig(
-        host = roots.host, remoteRoot = roots.remoteRoot, localRoot = Path(if (roots.direction == TransferDirection.UPLOAD) sourceBase(roots.localRoot.replace('\\', '/')) else roots.localRoot),
-        workers = options["--workers"]?.toInt() ?: 16, port = options["--port"]?.toInt() ?: 22,
+        // Preparation replaces the upload source root with the discovered source directory.
+        host = roots.host, remoteRoot = roots.remoteRoot, localRoot = Path(roots.localRoot),
+        workers = arguments.workers ?: 16, port = arguments.port ?: 22,
         identityFile = options["--identity"]?.let { kotlinx.io.files.Path(it) },
-        direction = roots.direction,
-        rsyncOptions = options["--rsync"],
+        direction = roots.direction, maxAttempts = arguments.attempts ?: 1,
+        rsyncOptions = options["--rsync"], sshOptions = options["--ssh"],
     ) }
     if (!demo && !confirmTransfer(arguments.paths, "--yes" in enabled, "--swing" in enabled)) {
         println("Synchronization cancelled. No transfers started.")
@@ -68,8 +79,10 @@ internal suspend fun launchMonitor(args: List<String>, platform: MonitorApplicat
         else {
             checkSshConnection(initialConfig)
             println("Collecting source files and sizes...")
-            prepareSources(initialConfig, allRoots, options["--files"]?.let(::Path), "--null" in enabled)
-                .also { println("Prepared ${it.tasks.size} files, ${it.tasks.sumOf { task -> requireNotNull(task.size) }} bytes; largest first.") }
+            prepareSources(initialConfig, allRoots, options["--files"]?.let(::Path), "--null" in enabled).also {
+                it.warnings.forEach { warning -> println("Warning: $warning") }
+                println("Prepared ${it.tasks.size} files, ${it.tasks.sumOf { task -> requireNotNull(task.size) }} bytes; largest first.")
+            }
         }
     val config = plan.config
     val tasks = if (demo) plan.tasks else {
@@ -98,18 +111,21 @@ internal suspend fun runMonitorService(
     try {
         server = platform.serve(source, endpoint)
         shutdown = platform.onShutdown {
-            try {
-                dispatcher.close()
-                server.close()
-            } finally { stop.complete(Unit) }
+            // Each step runs even if an earlier one fails, so the endpoint is removed and the service ends.
+            try { dispatcher.close() }
+            finally { try { server.close() } finally { stop.complete(Unit) } }
         }
         dispatcher.start()
         println("${if (demo) "DEMO (simulated data). " else ""}Monitor connection: $endpoint")
         println("Attach: rsync-airlift-monitor --attach \"$endpoint\"")
         println("Ctrl+C stops dispatcher. Q detaches while running; after completion Q exits an interactive run.")
         if (interactive) {
-            runPanel()
-            if (dispatcher.snapshot().finishedAtMillis != null) return
+            // The panel is only a view: a terminal failure must not cancel the transfers it shows.
+            val panelFailure = try { runPanel(); null }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) { error }
+            if (panelFailure != null) println("Monitor panel stopped: ${panelFailure.message ?: panelFailure::class.simpleName}")
+            else if (dispatcher.snapshot().finishedAtMillis != null) return
             println("Monitor detached. Dispatcher remains available at $endpoint")
         }
         stop.await()

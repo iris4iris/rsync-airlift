@@ -29,16 +29,40 @@ class MonitorFrame(val size: MonitorSize) {
     internal var backgroundColor: MonitorColor = MonitorColor.ANSI.BLACK
     internal fun putString(x: Int, y: Int, text: String, columns: Int = size.columns - x, pad: Boolean = false) {
         if (x < 0 || y !in 0 until size.rows || columns <= 0 || x >= size.columns) return
-        val safe = text.map { if (it.code < 32 || it.code in 127..159) ' ' else it }.joinToString("")
+        // C0/C1 controls (ESC, CSI, newline, tab...) from file names must never reach the terminal.
+        val safe = if (text.none { it.isTerminalControl() }) text
+            else buildString(text.length) { for (char in text) append(if (char.isTerminalControl()) ' ' else char) }
         drawing += TextRun(x, y, safe, foregroundColor, backgroundColor, minOf(columns, size.columns - x), pad)
     }
 }
+
+private fun Char.isTerminalControl() = code < 32 || code in 127..159
 
 /** Lifecycle and presentation belong to the platform, not to the monitor model. */
 interface MonitorTerminal {
     fun start()
     fun size(): MonitorSize
     fun present(frame: MonitorFrame)
+    /** Returns the next pending event without blocking, or null. */
     fun pollEvent(): MonitorEvent?
+    /**
+     * Suspends until an event is available or [timeoutMillis] elapse, then returns it (or null on timeout).
+     * The default polls [pollEvent] every [POLL_MILLIS]; a backend with a readable descriptor may wait on it.
+     * Further pending events are drained with [pollEvent].
+     */
+    suspend fun awaitEvent(timeoutMillis: Long): MonitorEvent? {
+        var remaining = timeoutMillis
+        while (true) {
+            pollEvent()?.let { return it }
+            if (remaining <= 0) return null
+            val step = minOf(POLL_MILLIS, remaining)
+            kotlinx.coroutines.delay(step)
+            remaining -= step
+        }
+    }
     fun close()
+
+    companion object {
+        const val POLL_MILLIS = 20L
+    }
 }

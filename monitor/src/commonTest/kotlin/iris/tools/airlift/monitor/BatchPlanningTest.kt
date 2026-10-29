@@ -40,6 +40,16 @@ class BatchPlanningTest {
         assertFails { batchSize("0") }
     }
 
+    @Test fun `small files from interleaved source roots are grouped per root`() {
+        val tasks = (1..100).map { TransferTask("Movies/f" + it.toString().padStart(3, '0'), 1, sourceRoot = if (it % 2 == 0) "/mnt/disk2" else "/mnt/disk1") }
+        val jobs = batchSmallFiles(tasks, 1000)
+        assertEquals(listOf("/mnt/disk1", "/mnt/disk2"), jobs.map { it.sourceRoot })
+        assertEquals(listOf(50, 50), jobs.map { it.fileCount })
+        assertEquals(jobs.first().files.sorted(), jobs.first().files)
+        val large = batchSmallFiles(listOf(TransferTask("big", 5000, sourceRoot = "/b"), TransferTask("a", 1, sourceRoot = "/a")), 1000)
+        assertEquals(listOf("big", "a"), large.map { it.path })
+    }
+
     @Test fun `minimum is a total load threshold rather than an individual file cutoff`() {
         val jobs = batchSmallFiles(listOf(TransferTask("a", 600), TransferTask("b", 2500)), 1024)
         assertEquals(1, jobs.size)

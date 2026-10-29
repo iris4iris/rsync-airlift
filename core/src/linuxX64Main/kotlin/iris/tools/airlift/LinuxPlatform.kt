@@ -10,7 +10,8 @@ import iris.tools.airlift.posix.*
 import iris.tools.airlift.process.LinuxProcessLauncher
 import kotlin.native.ref.createCleaner
 
-internal fun posixFailure(operation: String): Nothing = error("$operation: ${strerror(errno)?.toKString() ?: errno.toString()}")
+/** Pass [code] when other calls may have run since the failing one; errno is per-thread but not sticky. */
+internal fun posixFailure(operation: String, code: Int = errno): Nothing = error("$operation: ${strerror(code)?.toKString() ?: code.toString()}")
 
 internal actual fun platformLock(): PlatformLock = object : PlatformLock {
     private val mutex = nativeHeap.alloc<pthread_mutex_t>().ptr.also { ptr ->
@@ -80,8 +81,23 @@ private fun temporaryDirectory(parent: Path, prefix: String): Path {
     }
 }
 
+/** The ControlMaster socket name SshSession places inside its directory. */
+private const val SSH_SOCKET_NAME = "s"
+/** OpenSSH binds the master socket as "<ControlPath>.<16 random characters>" before renaming it. */
+private const val SSH_BIND_SUFFIX = 17
+/** sockaddr_un.sun_path holds 108 bytes including the terminating NUL. */
+private const val SOCKET_PATH_LIMIT = 107
+
+/** TMPDIR when it is absolute and short enough for the ControlMaster socket inside it, else /tmp. */
+internal fun sshTemporaryParent(tmpdir: String?, prefix: String): String {
+    val parent = tmpdir?.takeIf { it.startsWith('/') }?.trimEnd('/') ?: return "/tmp"
+    val socket = "$parent/${prefix}XXXXXX/$SSH_SOCKET_NAME"
+    if (socket.encodeToByteArray().size + SSH_BIND_SUFFIX > SOCKET_PATH_LIMIT) return "/tmp"
+    return parent.ifEmpty { "/" }
+}
+
 internal actual suspend fun platformSshTemporaryDirectory(prefix: String): Path = withContext(Dispatchers.IO) {
-    temporaryDirectory(Path(platformEnvironment()["TMPDIR"] ?: "/tmp"), prefix)
+    temporaryDirectory(Path(sshTemporaryParent(platformEnvironment()["TMPDIR"], prefix)), prefix)
 }
 internal actual suspend fun platformDeleteSshDirectory(path: Path) { withContext(Dispatchers.IO) {
     if (airlift_remove_directory(path.toString()) != 0) posixFailure("remove owned directory")

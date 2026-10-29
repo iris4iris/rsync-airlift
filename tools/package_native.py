@@ -10,6 +10,7 @@ import re
 import shutil
 import struct
 import tarfile
+import time
 
 
 def archive(entries, epoch):
@@ -39,6 +40,19 @@ def archive(entries, epoch):
     return gzip.compress(raw.getvalue(), compresslevel=9, mtime=0)
 
 
+def changelog(version, maintainer, epoch):
+    """Minimal Debian changelog (Policy 12.7); gzip without name or time keeps the package reproducible."""
+    days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    moment = time.gmtime(epoch)
+    date = (f"{days[moment.tm_wday]}, {moment.tm_mday:02d} {months[moment.tm_mon - 1]} {moment.tm_year} "
+            f"{moment.tm_hour:02d}:{moment.tm_min:02d}:{moment.tm_sec:02d} +0000")
+    text = (f"rsync-airlift ({version}) stable; urgency=medium\n\n"
+            f"  * Linux x86-64 Native build. See /usr/share/doc/rsync-airlift/README.md.\n\n"
+            f" -- {maintainer}  {date}\n")
+    return gzip.compress(text.encode("utf-8"), compresslevel=9, mtime=0)
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -60,9 +74,11 @@ def main():
     if max(tuple(int(n or b"0") for n in v) for v in versions) > (2, 14, 0):
         parser.error("newer glibc required: review the package dependencies")
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", int(args.binary.stat().st_mtime)))
+    # No copyright file: the project has not published a license, and one must not be invented here.
     data = [("usr/bin/rsync-airlift", binary, 0o755),
             ("usr/share/doc/rsync-airlift/README.md", (root / "README.md").read_bytes(), 0o644),
-            ("usr/share/doc/rsync-airlift/NATIVE.md", (root / "docs/NATIVE.md").read_bytes(), 0o644)]
+            ("usr/share/doc/rsync-airlift/NATIVE.md", (root / "docs/NATIVE.md").read_bytes(), 0o644),
+            ("usr/share/doc/rsync-airlift/changelog.Debian.gz", changelog(args.version, args.maintainer, epoch), 0o644)]
     control = f"""Package: rsync-airlift
 Version: {args.version}
 Section: utils

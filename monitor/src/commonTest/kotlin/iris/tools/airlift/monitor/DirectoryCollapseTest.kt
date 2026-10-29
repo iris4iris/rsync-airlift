@@ -46,6 +46,36 @@ class DirectoryCollapseTest {
         }
     }
 
+    @Test fun `aliases of destructive options and filter options disable collapse while option values are not scanned`() {
+        val disabling = listOf("--del", "--remove-sent-files", "--copy-unsafe-links", "--exclude=*.tmp", "--exclude '*.tmp'",
+            "--include=x", "--filter='- *.o'", "-f '- *.o'", "-avF", "-C", "--cvs-exclude", "-x", "--one-file-system",
+            "--exclude-from=list", "--include-from list", "--delete-after", "-aK", "--no-r")
+        for (options in disabling) assertFalse(CollapsePolicy.allows(options), options)
+        val allowed = listOf("-av --partial", "--delay-updates", "-T /tmp/Lkx", "--temp-dir /tmp/CFx", "--suffix=-L",
+            "--partial-dir=.Kx", "-B4096", "--existing", "--ignore-existing", "--max-size=1G", "--info=progress2", "-a --chmod=F644")
+        for (options in allowed) assertTrue(CollapsePolicy.allows(options), options)
+        val collapser = DirectoryCollapser(listOf(inventory("a/x", "a/y")), "-a --del")
+        assertTrue(collapser.optimize(job("a/x", "a/y")).entries.isEmpty())
+    }
+
+    @Test fun `inventories of one source root are merged and indexed by scope`() {
+        // 2,000 named source directories under one parent share a source root; optimize must not scan them all per job.
+        val inventories = (1..2000).map { DirectoryInventory("/data", "d$it", setOf("d$it/x", "d$it/y"), setOf("d$it"), emptySet()) }
+        val collapser = DirectoryCollapser(inventories)
+        val jobs = (1..2000).map { job("d$it/x", "d$it/y").copy(sourceRoot = "/data") }
+        assertTrue(jobs.all { collapser.optimize(it).entries == listOf("${it.path.substringBefore('/')}/") })
+        // The parent of the named directories is not provable from their scopes.
+        assertTrue(collapser.optimize(job("d1/x", "d1/y", "d2/x", "d2/y").copy(sourceRoot = "/data")).entries.let { it == listOf("d1/", "d2/") })
+    }
+
+    @Test fun `a depth limited listing keeps blocking directories another inventory lists only partly`() {
+        val limited = DirectoryInventory("/src", "", setOf("top"), setOf("", "one"), emptySet())
+        val nested = DirectoryInventory("/src", "one/sub", setOf("one/sub/a", "one/sub/b"), setOf("one/sub"), emptySet())
+        val collapser = DirectoryCollapser(listOf(limited, nested))
+        val entries = collapser.optimize(job("one/sub/a", "one/sub/b").copy(sourceRoot = "/src")).entries
+        assertEquals(listOf("one/sub/"), entries)
+    }
+
     @Test fun `large prefix stays size ordered while small tail becomes path ordered`() {
         val tasks = listOf(TransferTask("big-b", 300), TransferTask("big-a", 200), TransferTask("z", 90), TransferTask("a", 80), TransferTask("b", 10))
         val jobs = batchSmallFiles(tasks, 100)

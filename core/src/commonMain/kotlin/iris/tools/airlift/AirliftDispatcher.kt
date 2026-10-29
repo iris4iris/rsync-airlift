@@ -4,7 +4,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.io.files.Path
 
 /** Platform-independent, single-use dispatcher. Call close() to cancel its owned scope. */
@@ -24,6 +26,9 @@ class AirliftDispatcher(
         localDescription else "${config.host}:${config.remoteRoot}"
 
     private val mutex = Mutex()
+    // Start-up waves bound the first logins; this also bounds retries and reconnects, for example
+    // when every worker loses its master in the same network outage.
+    private val connectPermits = Semaphore(config.connectConcurrency)
     private val supervisor = SupervisorJob()
     private val scope = CoroutineScope(supervisor + dispatcher)
     private val wakeup = MutableStateFlow(0L)
@@ -95,7 +100,7 @@ class AirliftDispatcher(
     private fun signalLocked() { wakeup.value++ }
 
     suspend fun setWorkerCount(count: Int) = mutex.withLock {
-        require(count > 0)
+        require(count in 1..AirliftConfig.MAX_WORKERS) { "Workers must be between 1 and ${AirliftConfig.MAX_WORKERS}" }
         check(!cancelled && finalSnapshot == null)
         targetWorkers = count
         if (started && this::runDirectory.isInitialized) replenishLocked()
@@ -107,7 +112,7 @@ class AirliftDispatcher(
         while (!cancelled && queue.isNotEmpty() && liveWorkers - retiring.size < targetWorkers) {
             // A full wave must finish its connection attempts before the next one
             // starts. A semaphore alone would refill slots after each fast connect.
-            val count = minOf(5, targetWorkers - (liveWorkers - retiring.size))
+            val count = minOf(config.connectConcurrency, targetWorkers - (liveWorkers - retiring.size))
             val wave = ConnectionWave(connectionBarrier, count)
             connectionBarrier = wave.completed
             repeat(count) {
@@ -143,83 +148,75 @@ class AirliftDispatcher(
         }
     }
 
+    private enum class WorkerOutcome { FINISHED, LOST, LOST_AFTER_PROGRESS }
+
+    private fun backoffMillis(failures: Int): Long =
+        (config.retryDelayMillis * (1L shl (failures - 1).coerceIn(0, 5))).coerceAtMost(30_000)
+
     private suspend fun runWorker(id: Int, wave: ConnectionWave) {
         var transport: TransferSession? = null
         var fatal: String? = null
-        try {
-            try {
-                wave.previous.await()
-                currentCoroutineContext().ensureActive()
-                transport = transports.create(id)
-                mutex.withLock {
-                    if (cancelled) return
-                    activeTransports[id] = transport
-                }
-                transport.connect()
-            } finally {
-                // Failures/cancellation must not strand later waves. Notify outside
-                // the state mutex, since completion can resume another worker.
-                withContext(NonCancellable) {
-                    val release = mutex.withLock { --wave.remaining == 0 }
-                    if (release) wave.completed.complete(Unit)
-                }
+        // Only the first connection attempt belongs to the start-up wave; retries and reconnects
+        // wait for the connection semaphore instead, so a backoff never holds up later waves.
+        var pendingWave: ConnectionWave? = wave
+        suspend fun leaveWave() {
+            val current = pendingWave ?: return
+            pendingWave = null
+            // Failures/cancellation must not strand later waves. Notify outside
+            // the state mutex, since completion can resume another worker.
+            withContext(NonCancellable) {
+                val release = mutex.withLock { --current.remaining == 0 }
+                if (release) current.completed.complete(Unit)
             }
+        }
+        try {
+            wave.previous.await()
+            currentCoroutineContext().ensureActive()
+            // Consecutive connection failures; a completed job resets the count.
+            var failures = 0
+            var lastError: String? = null
             while (true) {
-                val task = takeTask(id) ?: break
-                val taskStartedAt = clock.monotonicNanos()
-                var error: String? = null
-                var success = false
-                for (attempt in 1..config.maxAttempts) {
-                    if (mutex.withLock { cancelled }) break
-                    val log = logs.attemptPath(runDirectory, id, taskIndexes.getValue(task.id), attempt)
-                    mutex.withLock {
-                        states[task.id] = states.getValue(task.id).copy(attempts = attempt, progress = null,
-                            logFile = log, progressUpdatedAtNanos = null)
+                val session = transports.create(id)
+                transport = session
+                val registered = mutex.withLock {
+                    if (!cancelled) {
+                        activeTransports[id] = session
+                        workers[id] = WorkerState(id, WorkerStatus.CONNECTING, workers[id]?.taskId, workers[id]?.error)
                     }
-                    try {
-                        val code = transport.transfer(task, log) { progress ->
-                            mutex.withLock {
-                                states[task.id] = states.getValue(task.id).copy(progress = progress,
-                                    progressUpdatedAtNanos = clock.monotonicNanos())
-                            }
-                        }
-                        success = code == 0
-                        val details = if (success) null else transport.failureDetails?.takeIf { it.isNotBlank() }
-                        error = if (success) null else {
-                            val reason = details?.replace(
-                                Regex("^(?:/[^ ]*/)?(?:bash|sh|dash|zsh|ksh): (?:line [0-9]+: )?"), ""
-                            )?.trimEnd('.', ' ')
-                            "${reason ?: "rsync failed"} (code $code)."
-                        }
-                    } catch (e: CancellationException) {
-                        // A transport-local timeout is an attempt failure, not cancellation of the run.
-                        currentCoroutineContext().ensureActive()
-                        error = e.message ?: "Transfer cancelled"
-                    } catch (e: Exception) {
-                        error = e.message ?: "Transfer failed"
-                    }
-                    if (success) break
-                    if (attempt < config.maxAttempts) delay(config.retryDelayMillis)
+                    !cancelled
                 }
-                mutex.withLock {
-                    val current = states.getValue(task.id)
-                    val elapsedSeconds = (clock.monotonicNanos() - taskStartedAt).coerceAtLeast(1) / 1_000_000_000.0
-                    val size = task.size ?: current.progress?.logicalBytes
-                    val finalProgress = if (success && !cancelled) {
-                        (current.progress ?: TransferProgress(size ?: 0, null, null)).copy(
-                            logicalBytes = size ?: current.progress?.logicalBytes ?: 0,
-                            matchedBytes = if (task.fileCount > 1 && size != null && current.progress?.matchedBytes != null && current.progress.literalBytes != null)
-                                current.progress.matchedBytes + (size - current.progress.matchedBytes - current.progress.literalBytes).coerceAtLeast(0)
-                                else current.progress?.matchedBytes,
-                            bytesPerSecond = size?.toDouble()?.div(elapsedSeconds), remainingSeconds = null, percent = 100,
-                        )
-                    } else current.progress
-                    states[task.id] = current.copy(
-                        status = if (cancelled) TaskStatus.CANCELLED else if (success) TaskStatus.SUCCEEDED else TaskStatus.FAILED,
-                        error = error, progress = finalProgress,
-                    )
-                    workers[id] = WorkerState(id, WorkerStatus.IDLE, task.id)
+                if (!registered) return
+                val connected = try {
+                    connectPermits.withPermit { session.connect() }
+                    true
+                } catch (e: CancellationException) {
+                    // A transport-local timeout is a connection failure, not cancellation of the run.
+                    currentCoroutineContext().ensureActive()
+                    lastError = e.message ?: "SSH connection timed out"
+                    false
+                } catch (e: Exception) {
+                    lastError = e.message ?: "SSH connection failed"
+                    false
+                } finally {
+                    leaveWave()
                 }
+                val outcome = if (connected) transferLoop(id, session) else null
+                if (outcome == WorkerOutcome.FINISHED) break
+                if (outcome != null) lastError = "SSH connection lost"
+                failures = if (outcome == WorkerOutcome.LOST_AFTER_PROGRESS) 1 else failures + 1
+                withContext(NonCancellable) {
+                    runCatching { session.close() }
+                    mutex.withLock { activeTransports.remove(id) }
+                }
+                transport = null
+                if (failures >= config.connectAttempts) { fatal = lastError; break }
+                val stop = mutex.withLock {
+                    workers[id] = WorkerState(id, WorkerStatus.CONNECTING, workers[id]?.taskId,
+                        "$lastError; reconnecting (${failures + 1}/${config.connectAttempts})")
+                    cancelled || queue.isEmpty()
+                }
+                if (stop) break
+                delay(backoffMillis(failures))
             }
         } catch (e: CancellationException) {
             val stopping = withContext(NonCancellable) { mutex.withLock { cancelled } }
@@ -228,6 +225,8 @@ class AirliftDispatcher(
         } catch (e: Exception) {
             fatal = e.message ?: "Worker failed"
         } finally {
+            // Shutdown before the first connection attempt must still release the wave.
+            leaveWave()
             // Cancellation must not skip acquiring the mutex and publishing final state.
             withContext(NonCancellable) {
                 runCatching { transport?.close() }
@@ -260,6 +259,103 @@ class AirliftDispatcher(
                 publishCompletion(final)
             }
         }
+    }
+
+    /** Runs jobs over one connection. A job that fails because the connection died goes back to the queue. */
+    private suspend fun transferLoop(id: Int, transport: TransferSession): WorkerOutcome {
+        var completedJobs = 0
+        while (true) {
+            val task = takeTask(id) ?: return WorkerOutcome.FINISHED
+            val taskStartedAt = clock.monotonicNanos()
+            // Attempt numbers continue after a requeue so earlier attempt logs are kept.
+            val previousAttempts = mutex.withLock { states.getValue(task.id).attempts }
+            var error: String? = null
+            var warning: String? = null
+            var success = false
+            var lost = false
+            for (attempt in 1..config.maxAttempts) {
+                if (mutex.withLock { cancelled }) break
+                val number = previousAttempts + attempt
+                val log = logs.attemptPath(runDirectory, id, taskIndexes.getValue(task.id), number)
+                mutex.withLock {
+                    states[task.id] = states.getValue(task.id).copy(attempts = number, progress = null,
+                        logFile = log, progressUpdatedAtNanos = null)
+                }
+                try {
+                    val code = transport.transfer(task, log) { progress ->
+                        mutex.withLock {
+                            states[task.id] = states.getValue(task.id).copy(progress = progress,
+                                progressUpdatedAtNanos = clock.monotonicNanos())
+                        }
+                    }
+                    success = code == 0 || code == VANISHED_SOURCE_FILES
+                    warning = if (code == VANISHED_SOURCE_FILES) VANISHED_WARNING else null
+                    error = if (success) null else failureMessage(transport.failureDetails, code)
+                } catch (e: CancellationException) {
+                    // A transport-local timeout is an attempt failure, not cancellation of the run.
+                    currentCoroutineContext().ensureActive()
+                    error = e.message ?: "Transfer cancelled"
+                } catch (e: Exception) {
+                    error = e.message ?: "Transfer failed"
+                }
+                if (success) break
+                // A dead ControlMaster fails every later job in milliseconds; stop before draining the queue.
+                if (!connectionAlive(transport)) { lost = true; break }
+                if (attempt < config.maxAttempts) delay(config.retryDelayMillis)
+            }
+            if (lost) {
+                val requeued = mutex.withLock {
+                    if (!cancelled) {
+                        states[task.id] = states.getValue(task.id).copy(status = TaskStatus.QUEUED, progress = null,
+                            progressUpdatedAtNanos = null)
+                        queue.addFirst(task.id)
+                        workers[id] = WorkerState(id, WorkerStatus.CONNECTING, task.id, "SSH connection lost")
+                        signalLocked()
+                    }
+                    !cancelled
+                }
+                if (requeued) return if (completedJobs > 0) WorkerOutcome.LOST_AFTER_PROGRESS else WorkerOutcome.LOST
+            }
+            mutex.withLock {
+                val current = states.getValue(task.id)
+                val elapsedSeconds = (clock.monotonicNanos() - taskStartedAt).coerceAtLeast(1) / 1_000_000_000.0
+                val size = task.size ?: current.progress?.logicalBytes
+                val finalProgress = if (success && !cancelled) {
+                    (current.progress ?: TransferProgress(size ?: 0, null, null)).copy(
+                        logicalBytes = size ?: current.progress?.logicalBytes ?: 0,
+                        matchedBytes = if (task.fileCount > 1 && size != null && current.progress?.matchedBytes != null && current.progress.literalBytes != null)
+                            current.progress.matchedBytes + (size - current.progress.matchedBytes - current.progress.literalBytes).coerceAtLeast(0)
+                            else current.progress?.matchedBytes,
+                        bytesPerSecond = size?.toDouble()?.div(elapsedSeconds), remainingSeconds = null, percent = 100,
+                    )
+                } else current.progress
+                states[task.id] = current.copy(
+                    status = if (cancelled) TaskStatus.CANCELLED else if (success) TaskStatus.SUCCEEDED else TaskStatus.FAILED,
+                    error = error, warning = warning, progress = finalProgress,
+                )
+                workers[id] = WorkerState(id, WorkerStatus.IDLE, task.id)
+            }
+            if (success) completedJobs++
+        }
+    }
+
+    private suspend fun connectionAlive(transport: TransferSession): Boolean = try {
+        transport.isConnected()
+    } catch (e: CancellationException) {
+        currentCoroutineContext().ensureActive()
+        false
+    } catch (_: Exception) { false }
+
+    private fun failureMessage(details: String?, code: Int): String {
+        val reason = details?.takeIf { it.isNotBlank() }?.replace(SHELL_PREFIX, "")?.trimEnd('.', ' ')
+        return "${reason ?: "rsync failed"} (code $code)."
+    }
+
+    private companion object {
+        /** rsync exit code 24: some source files vanished while the transfer ran. */
+        const val VANISHED_SOURCE_FILES = 24
+        const val VANISHED_WARNING = "Some source files vanished before they were copied (code 24)."
+        val SHELL_PREFIX = Regex("^(?:/[^ ]*/)?(?:bash|sh|dash|zsh|ksh): (?:line [0-9]+: )?")
     }
 
     /** Cancel the run and unblock transports. awaitCompletion() waits for worker cleanup/accounting. */

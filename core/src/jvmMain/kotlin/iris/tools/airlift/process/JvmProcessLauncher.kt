@@ -9,11 +9,18 @@ import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+/**
+ * Each blocked pipe read or write holds a thread until the child acts. On Dispatchers.IO alone (64 threads)
+ * enough workers could park every thread in a read while the writes that feed those children wait in the queue.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+internal val processIo: CoroutineDispatcher = Dispatchers.IO.limitedParallelism(4096)
+
 /** Blocking pipe operations belong to this adapter, regardless of the caller's dispatcher. */
 class JvmProcessLauncher : ProcessLauncher {
     override suspend fun start(spec: ProcessSpec): ChildProcess {
         val child = withContext(NonCancellable) {
-            withContext(Dispatchers.IO) {
+            withContext(processIo) {
                 val builder = ProcessBuilder(spec.command)
                 if (!spec.inheritEnvironment) builder.environment().clear()
                 spec.environment.forEach { (key, value) ->
@@ -42,7 +49,7 @@ class JvmProcessLauncher : ProcessLauncher {
 
 private class JvmChildProcess(private val process: Process, spec: ProcessSpec) : ChildProcess {
     private val ioJob = SupervisorJob()
-    private val ioScope = CoroutineScope(ioJob + Dispatchers.IO)
+    private val ioScope = CoroutineScope(ioJob + processIo)
     private val closeMutex = Mutex()
     private var closed = false
 
@@ -78,14 +85,14 @@ private class JvmChildProcess(private val process: Process, spec: ProcessSpec) :
         return exitCode() ?: withTimeoutOrNull(timeoutMillis) { awaitExit() }
     }
     override suspend fun terminate(force: Boolean) {
-        withContext(Dispatchers.IO) { if (force) process.destroyForcibly() else process.destroy(); Unit }
+        withContext(processIo) { if (force) process.destroyForcibly() else process.destroy(); Unit }
     }
     override suspend fun close(): Unit = withContext(NonCancellable) {
         closeMutex.withLock {
             if (closed) return@withLock
             terminate()
             if (awaitExit(2000) == null) { terminate(force = true); awaitExit() }
-            withContext(Dispatchers.IO) {
+            withContext(processIo) {
                 runCatching { process.outputStream.close() }
                 runCatching { process.inputStream.close() }
                 runCatching { process.errorStream.close() }

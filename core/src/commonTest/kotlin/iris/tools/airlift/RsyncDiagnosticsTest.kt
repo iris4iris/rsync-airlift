@@ -3,6 +3,12 @@ package iris.tools.airlift
 import kotlin.test.*
 
 class RsyncDiagnosticsTest {
+    @Test fun `escaped non-ASCII file names are shown readably`() {
+        val diagnostics = RsyncDiagnostics()
+        diagnostics.accept("rsync: [sender] link_stat \"/src/\\#321\\#204\\#320\\#260\\#320\\#271\\#320\\#273.bin\" failed: No such file or directory (2)")
+        assertEquals("rsync: [sender] link_stat \"/src/файл.bin\" failed: No such file or directory (2)", diagnostics.summary())
+    }
+
     @Test fun `remote missing command precedes generic rsync summary`() {
         val diagnostics = RsyncDiagnostics()
         diagnostics.accept("bash: rsync: command not found")

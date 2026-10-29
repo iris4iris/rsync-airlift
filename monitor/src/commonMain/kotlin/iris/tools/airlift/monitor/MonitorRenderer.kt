@@ -36,7 +36,8 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
                 if (used >= limit) break
                 val text = part.text.take(limit - used)
                 graphics.foregroundColor = if (reduction) MonitorColor.ANSI.BLACK else part.color
-                graphics.putString(x + used, y, text)
+                // Clip to the cell so wide characters can never spill into a neighbouring column.
+                graphics.putString(x + used, y, text, limit - used)
                 used += text.length
             }
             graphics.foregroundColor = if (reduction) MonitorColor.ANSI.BLACK else MonitorColor.ANSI.WHITE
@@ -48,23 +49,24 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
             line(height - 1, if (snapshot.finishedAtMillis == null) "Q Detach (transfers continue)" else "Q Exit")
             return screen
         }
+        val stats = MonitorStats.of(snapshot)
         val state = when {
             snapshot.cancelled -> "CANCELLED"
-            snapshot.finishedAtMillis != null -> if (snapshot.failed > 0) "FINISHED WITH ERRORS" else "FINISHED"
+            snapshot.finishedAtMillis != null -> when {
+                stats.failedFiles > 0 -> "FINISHED WITH ERRORS"
+                stats.warnings > 0 -> "FINISHED WITH WARNINGS"
+                else -> "FINISHED"
+            }
             snapshot.paused -> "PAUSED (active files continue)"
             snapshot.startedAtMillis == null -> "NOT STARTED"
             else -> "RUNNING"
         }
         val elapsed = snapshot.startedAtMillis?.let { ((snapshot.finishedAtMillis ?: monitorWallTimeMillis()) - it).coerceAtLeast(0) / 1000 }
-        val rate = overallRate.value(snapshot)
-        val allKnown = snapshot.tasks.all { it.task.size != null }
-        val total = snapshot.tasks.sumOf { it.task.size ?: 0 }
-        val processed = snapshot.tasks.sumOf {
-            if (it.status == TaskStatus.SUCCEEDED) it.task.size ?: it.progress?.logicalBytes ?: 0
-            else if (it.status == TaskStatus.RUNNING) (it.progress?.logicalBytes ?: 0).let { count -> it.task.size?.let { size -> count.coerceAtMost(size) } ?: count }
-            else 0
-        }
-        val eta = if (allKnown && rate != null && rate > 0 && snapshot.failed == 0 && !snapshot.paused)
+        val rate = overallRate.value(snapshot, stats.running)
+        val allKnown = stats.allSizesKnown
+        val total = stats.totalBytes
+        val processed = stats.processedBytes
+        val eta = if (allKnown && rate != null && rate > 0 && stats.failedFiles == 0 && !snapshot.paused)
             ceil((total - processed).coerceAtLeast(0) / rate).toLong() else null
         val finished = snapshot.finishedAtMillis != null
         val displayRate = if (finished) snapshot.startedAtMillis?.let { start ->
@@ -72,17 +74,18 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
             if (elapsedMillis > 0) processed.toDouble() * 1000 / elapsedMillis else null
         } else rate
         val etaText = if (finished) "" else " | ETA ${duration(eta)}"
-        val ratio = MonitorModel.overallProgress(snapshot)
+        val ratio = stats.progress
         line(0, "$title | $state", MonitorColor.ANSI.CYAN)
         line(1, "From: ${source.from}")
         line(2, "To:   ${source.to}")
         val workerCount = if (finished) snapshot.targetWorkers else snapshot.workers.count {
-            it.status in setOf(WorkerStatus.CONNECTING, WorkerStatus.IDLE, WorkerStatus.TRANSFERRING)
+            it.status == WorkerStatus.CONNECTING || it.status == WorkerStatus.IDLE || it.status == WorkerStatus.TRANSFERRING
         }
-        val failedText = if (snapshot.failed > 0) " | Failed ${snapshot.failed}" else ""
-        line(3, "Workers $workerCount | Files ${snapshot.completed}/${snapshot.tasks.sumOf { it.task.fileCount }}$failedText | Elapsed ${duration(elapsed)}")
+        val failedText = if (stats.failedFiles > 0) " | Failed ${stats.failedFiles}" else ""
+        val warningText = if (stats.warnings > 0) " | Warnings ${stats.warnings}" else ""
+        line(3, "Workers $workerCount | Files ${stats.completedFiles}/${stats.totalFiles}$failedText$warningText | Elapsed ${duration(elapsed)}")
         line(4, "Processed ${bytes(processed)} / ${if (allKnown) bytes(total) else "unknown total"} | ${displayRate?.let { bytes(it.toLong()) + "/s" } ?: "--/s"}$etaText")
-        val breakdown = OverallBreakdown.from(snapshot)
+        val breakdown = OverallBreakdown.from(snapshot, stats)
         val barWidth = (width - 10).coerceAtMost(100)
         segments(0, 5, listOf(RowSegment("[")) + breakdown.segments(barWidth) +
             RowSegment("] ${fixedOne(ratio * 100) + "%"}"), width)
@@ -91,10 +94,10 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
         val detailHeight = if (model.details && height >= 22) 4 else 0
         val rowCount = (height - 11 - detailHeight).coerceAtLeast(1)
         model.bodyBottom = 9 + rowCount
-        val grid = WorkerGrid(width, model.visibleWorkers(snapshot).size, rowCount)
-        val rows = model.rows(snapshot, grid.cellWidth)
-        model.selected = model.selected.coerceIn(0, (rows.size - 1).coerceAtLeast(0))
         val workersView = model.view == MonitorView.WORKERS
+        val grid = WorkerGrid(width, if (workersView) model.visibleWorkers(snapshot).size else 0, rowCount)
+        val rows = model.rowList(snapshot, grid.cellWidth)
+        model.resolveSelection(rows)
         model.gridRows = if (workersView) grid.rows else 1
         model.pageCapacity = if (workersView) grid.capacity else rowCount
         if (workersView) {
@@ -105,34 +108,41 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
             }
         }
         val offset = if (workersView) model.selected / grid.capacity * grid.capacity else (model.selected - rowCount + 1).coerceAtLeast(0)
-        if (rows.isEmpty()) line(9, "No entries.")
+        if (rows.size == 0) line(9, "No entries.")
+        // Only the visible page is materialized, however long the queue is.
         if (workersView) {
-            rows.drop(offset).take(grid.capacity).forEachIndexed { index, row ->
-                val (x, y) = grid.position(index)
-                segments(x, 9 + y, row.segments, grid.cellWidth, offset + index == model.selected, row.pendingReduction)
-                model.mouseRows.add(MonitorModel.MouseRow(x, 9 + y, grid.cellWidth, offset + index))
+            for (index in offset until minOf(rows.size, offset + grid.capacity)) {
+                val row = rows.row(index)
+                val (x, y) = grid.position(index - offset)
+                segments(x, 9 + y, row.segments, grid.cellWidth, index == model.selected, row.pendingReduction)
+                model.mouseRows.add(MonitorModel.MouseRow(x, 9 + y, grid.cellWidth, index))
             }
         } else {
-        rows.drop(offset).take(rowCount).forEachIndexed { index, row ->
-            val y = 9 + index
-            val selected = offset + index == model.selected
-            line(y, row.text, if (row.error != null) MonitorColor.ANSI.RED else MonitorColor.ANSI.WHITE, selected)
-            model.mouseRows.add(MonitorModel.MouseRow(0, y, width, offset + index))
-        }
+            for (index in offset until minOf(rows.size, offset + rowCount)) {
+                val row = rows.row(index)
+                val y = 9 + index - offset
+                val color = when {
+                    row.error != null -> MonitorColor.ANSI.RED
+                    row.warning != null -> MonitorColor.ANSI.YELLOW
+                    else -> MonitorColor.ANSI.WHITE
+                }
+                line(y, row.text, color, index == model.selected)
+                model.mouseRows.add(MonitorModel.MouseRow(0, y, width, index))
+            }
         }
         if (detailHeight > 0) {
-            val row = rows.getOrNull(model.selected)
+            val row = if (rows.size > 0) rows.row(model.selected) else null
             val task = row?.task
             val y = height - 6
             val workerId = row?.workerId ?: snapshot.workers.firstOrNull { task != null && it.taskId == task.task.id }?.id
             val worker = snapshot.workers.firstOrNull { it.id == workerId }
             line(y, "DETAILS WORKER${workerId?.let { " " + it.toString().padStart(3, '0') } ?: ""}", MonitorColor.ANSI.CYAN)
-            val currentName = task?.progress?.currentFile ?: if ((task?.task?.fileCount ?: 1) > 1) "awaiting rsync filename" else task?.task?.path ?: "--"
+            val batch = (task?.task?.fileCount ?: 1) > 1
+            val currentName = task?.progress?.currentFile ?: if (batch) "awaiting rsync filename" else task?.task?.path ?: "--"
             line(y + 1, "File: $currentName")
-            val batchInfo = if ((task?.task?.fileCount ?: 1) > 1) {
-                val index = task!!.task.files.indexOf(task.progress?.currentFile).takeIf { it >= 0 }?.plus(1)
+            val batchInfo = if (task != null && batch) {
                 val position = if (task.status == TaskStatus.SUCCEEDED) "Processed ${task.task.fileCount}/${task.task.fileCount}"
-                    else "file ${index ?: "--"}/${task.task.fileCount}"
+                    else "file ${task.progress?.currentFileIndex ?: "--"}/${task.task.fileCount}"
                 " | Files ${task.task.fileCount} | $position | sent ${task.progress?.transferredFiles ?: 0}"
             } else ""
             val displayedStatus = if (MonitorModel.finishing(task)) "FINISHING" else task?.status ?: worker?.status ?: "--"
@@ -140,9 +150,15 @@ class MonitorRenderer(private val source: MonitorSource, private val title: Stri
                 " | Speed ${task?.let { MonitorModel.rate(it) } ?: "--/s"} | attempt ${task?.attempts ?: 0}"
             line(y + 2, statusInfo)
             val error = task?.error ?: row?.error
-            line(y + 3, error?.let { "Error: $it" } ?: "", MonitorColor.ANSI.RED)
+            val warning = task?.warning ?: row?.warning
+            when {
+                error != null -> line(y + 3, "Error: $error", MonitorColor.ANSI.RED)
+                warning != null -> line(y + 3, "Warning: $warning", MonitorColor.ANSI.YELLOW)
+                else -> line(y + 3, "")
+            }
         }
-        segments(0, height - 2, if (model.message.isNotEmpty()) listOf(RowSegment(model.message, MonitorColor.ANSI.YELLOW)) else listOf(
+        val notice = model.connectionStatus ?: model.message
+        segments(0, height - 2, if (notice.isNotEmpty()) listOf(RowSegment(notice, MonitorColor.ANSI.YELLOW)) else listOf(
             RowSegment("Overall: "), RowSegment("matched ", MonitorColor.ANSI.CYAN), RowSegment("new/processed ", MonitorColor.ANSI.GREEN),
             RowSegment("failed ", MonitorColor.ANSI.RED), RowSegment("active remaining", MonitorColor.ANSI.YELLOW)), width)
         line(height - 1, "Arrows Select | F2 Details | P Pause | +/- Workers | Q ${if (snapshot.finishedAtMillis == null) "Detach" else "Exit"}", MonitorColor.ANSI.CYAN)

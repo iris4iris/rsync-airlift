@@ -15,9 +15,10 @@ internal fun batchSmallFiles(tasks: List<TransferTask>, minBytes: Long = 5L * 10
         pending.clear(); bytes = 0
     }
     val tail = tasks.indexOfFirst { it.size?.let { size -> size < minBytes } == true }.let { if (it < 0) tasks.size else it }
-    val ordered = tasks.take(tail) + tasks.drop(tail).sortedBy { it.path }
+    // Group the small tail by source root: a root change ends a job, so interleaved roots would defeat batching.
+    val ordered = tasks.take(tail) + tasks.drop(tail).sortedWith(compareBy<TransferTask>({ it.sourceRoot }, { it.path }))
     for (task in ordered) {
-        if (task.size == null || task.files.isNotEmpty()) {
+        if (task.size == null || task.isBatch) {
             flush(); result.add(task); continue
         }
         if (pending.isNotEmpty() && pending.first().sourceRoot != task.sourceRoot) flush()

@@ -44,11 +44,24 @@ internal fun drawFrame(screen: Screen, frame: MonitorFrame) {
     for (run in frame.runs) {
         graphics.foregroundColor = run.foreground.lanterna()
         graphics.backgroundColor = run.background.lanterna()
-        var text = run.text
-        while (text.isNotEmpty() && TerminalTextUtils.getColumnWidth(text) > run.columns) text = text.dropLast(1)
-        val padding = if (run.pad) " ".repeat((run.columns - TerminalTextUtils.getColumnWidth(text)).coerceAtLeast(0)) else ""
+        val (text, used) = clipColumns(run.text, run.columns)
+        val padding = if (run.pad) " ".repeat((run.columns - used).coerceAtLeast(0)) else ""
         graphics.putString(run.x, run.y, text + padding)
     }
+}
+
+/** Longest prefix fitting [columns] display cells, in one pass and never splitting a surrogate pair. */
+internal fun clipColumns(text: String, columns: Int): Pair<String, Int> {
+    var used = 0
+    var end = 0
+    while (end < text.length) {
+        val next = if (text[end].isHighSurrogate() && end + 1 < text.length && text[end + 1].isLowSurrogate()) end + 2 else end + 1
+        val width = TerminalTextUtils.getColumnWidth(text.substring(end, next))
+        if (used + width > columns) break
+        used += width
+        end = next
+    }
+    return (if (end == text.length) text else text.substring(0, end)) to used
 }
 
 /** JVM compatibility helpers for existing virtual-terminal checks. */

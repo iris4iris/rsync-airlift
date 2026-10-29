@@ -42,33 +42,53 @@ class SourceInventoryTest {
 
     @Test fun `remote discovery uses portable process with fragmented UTF8 and separate stderr`() = runTest {
         val child = Child("D\u0000f\t12\tпапка/имя\u0000", error = "diagnostic".repeat(10000))
-        val result = readInventory(config, "/data/a'b", ProcessLauncher { spec ->
+        val result = readInventory(config, SourceQuery("/data/a'b"), ProcessLauncher { spec ->
             assertFalse(spec.mergeError)
             assertEquals(ProcessRedirect.Pipe, spec.error)
-            assertContains(spec.command.last(), "a'\"'\"'b")
+            assertContains(spec.command.last(), "/data/a\\047b")
             child
         })
-        assertEquals(mapOf("папка/имя" to 12L), result.sizes)
+        assertEquals(mapOf("папка/имя" to 12L), result.inventory.sizes)
+        assertEquals(SourceMatch.LITERAL, result.match)
         assertTrue(child.closed && child.inputClosed)
+    }
+
+    @Test fun `extra SSH options follow Airlift options and precede the host`() = runTest {
+        val custom = config.copy(sshOptions = "-o Compression=no -c aes128-gcm@openssh.com")
+        readInventory(custom, SourceQuery("/data"), ProcessLauncher { spec ->
+            val command = spec.command
+            val host = command.indexOf("user@host")
+            assertEquals(listOf("-o", "Compression=no", "-c", "aes128-gcm@openssh.com"), command.subList(host - 4, host))
+            assertTrue(command.indexOf("StrictHostKeyChecking=yes") < host - 4)
+            Child("D\u0000d\t0\t\u0000")
+        })
     }
 
     @Test fun `failed SSH reports bounded diagnostic and closes process`() = runTest {
         val child = Child("", 255, "x".repeat(20000) + "Permission denied")
-        val error = assertFailsWith<IllegalStateException> { readInventory(config, "/data", ProcessLauncher { child }) }
+        val error = assertFailsWith<IllegalStateException> { readInventory(config, SourceQuery("/data"), ProcessLauncher { child }) }
         assertContains(error.message.orEmpty(), "Permission denied")
-        assertTrue(error.message!!.length < 4200)
+        assertContains(error.message.orEmpty(), "GNU find")
+        assertTrue(error.message!!.length < 4400)
         assertTrue(child.closed)
+    }
+
+    @Test fun `missing remote source has a clear error`() = runTest {
+        val error = assertFailsWith<IllegalStateException> {
+            readInventory(config, SourceQuery("/data/missing"), ProcessLauncher { Child("", 3, "Source does not exist") })
+        }
+        assertEquals("Source does not exist on user@host: /data/missing", error.message)
     }
 
     @Test fun `truncated record closes process`() = runTest {
         val child = Child("D\u0000f\t12\tunfinished")
-        assertFailsWith<IllegalStateException> { readInventory(config, "/data", ProcessLauncher { child }) }
+        assertFailsWith<IllegalStateException> { readInventory(config, SourceQuery("/data"), ProcessLauncher { child }) }
         assertTrue(child.closed)
     }
 
     @Test fun `cancellation closes a process blocked reading inventory`() = runTest {
         val child = Child("", block = true)
-        val job = launch { readInventory(config, "/data", ProcessLauncher { child }) }
+        val job = launch { readInventory(config, SourceQuery("/data"), ProcessLauncher { child }) }
         runCurrent()
         job.cancelAndJoin()
         assertTrue(child.closed)
@@ -78,7 +98,7 @@ class SourceInventoryTest {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         val child = Child("D\u0000")
-        val job = launch { readInventory(config, "/data", ProcessLauncher {
+        val job = launch { readInventory(config, SourceQuery("/data"), ProcessLauncher {
             entered.complete(Unit); release.await(); child
         }) }
         entered.await()

@@ -2,73 +2,121 @@ package iris.tools.airlift.monitor
 
 import iris.tools.airlift.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.io.files.Path
 
-private const val PROTOCOL = 3
+internal const val PROTOCOL = 4
 private const val VERSION_ERROR = "Monitor protocol changed. Restart dispatcher and monitor together."
+/** Token and command fields are short ASCII; longer declarations are rejected before their body is read. */
+private const val MAX_TOKEN_BYTES = 64
+private const val MAX_COMMAND_BYTES = 32
 
-/** Local authenticated endpoint. Transport supplies only loopback sockets. */
-class MonitorServer(private val source: MonitorSource, val endpoint: Path) : AutoCloseable {
+/** Limits for unauthenticated and authenticated connection phases. */
+internal data class MonitorServerLimits(
+    val connections: Int = 8,
+    val requestMillis: Long = 5_000,
+    val responseMillis: Long = 30_000,
+    val acceptRetryMillis: Long = 1_000,
+)
+
+/** Local authenticated endpoint. Transport supplies only loopback sockets.
+ * Each connection runs in its own coroutine; at most [MonitorServerLimits.connections] are served at once and
+ * further connections are closed immediately. The unauthenticated request phase has a short overall deadline. */
+class MonitorServer internal constructor(
+    private val source: MonitorSource, val endpoint: Path, private val limits: MonitorServerLimits,
+    transport: MonitorTransport,
+) : AutoCloseable {
+    constructor(source: MonitorSource, endpoint: Path) : this(source, endpoint, MonitorServerLimits(), monitorTransport())
+
     private val token = monitorToken()
-    private val listener = monitorTransport().listen()
+    private val tokenBytes = modifiedUtf8(token)
+    private val listener = transport.listen()
     private val scope = CoroutineScope(SupervisorJob() + preparationDispatcher())
     private val closed = MutableStateFlow(false)
     private val active = MutableStateFlow<Set<MonitorSocket>>(emptySet())
-    private val queue = Channel<MonitorSocket>(16, onUndeliveredElement = { it.close() })
+    private val permits = Semaphore(limits.connections)
 
     init {
         try {
             writeConnectionFile(endpoint, mapOf("port" to listener.port.toString(), "token" to token,
                 "title" to source.title, "from" to source.from, "to" to source.to, "protocol" to PROTOCOL.toString()))
         } catch (error: Exception) { listener.close(); scope.cancel(); throw error }
-        repeat(2) {
-            scope.launch {
-                for (socket in queue) {
-                    active.update { it + socket }
-                    try {
-                        if (!closed.value) handle(socket)
-                    } catch (cancelled: CancellationException) { throw cancelled }
-                    catch (_: Exception) { /* A malformed/disconnected client affects only its own request. */ }
-                    finally { socket.close(); active.update { it - socket } }
-                }
+        scope.launch { acceptLoop() }
+    }
+
+    private suspend fun acceptLoop() {
+        var failures = 0
+        while (!closed.value) {
+            val socket = try { listener.accept() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) {
+                // Transient failures such as EMFILE or ECONNABORTED must not end the service.
+                if (closed.value) return
+                failures++
+                delay(minOf(limits.acceptRetryMillis, 25L shl minOf(failures, 6)))
+                continue
             }
-        }
-        scope.launch {
-            try {
-                while (isActive) {
-                    val socket = listener.accept()
-                    if (closed.value || queue.trySend(socket).isFailure) socket.close()
-                }
-            } catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { /* Listener closed. */ }
+            failures = 0
+            if (closed.value || !permits.tryAcquire()) { socket.close(); continue }
+            active.update { it + socket }
+            // ATOMIC: cleanup in finally runs even if close() cancels the scope before dispatch.
+            scope.launch(start = CoroutineStart.ATOMIC) {
+                try { serve(socket) }
+                catch (_: TimeoutCancellationException) { /* A slow client loses only its own connection. */ }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { /* A malformed/disconnected client affects only its own request. */ }
+                finally { socket.close(); active.update { it - socket }; permits.release() }
+            }
         }
     }
 
-    private suspend fun handle(socket: MonitorSocket) {
+    private suspend fun serve(socket: MonitorSocket) {
+        if (closed.value) return
         val input = MonitorInput(socket)
         val output = MonitorOutput(socket)
-        val version = input.readInt()
-        if (input.readUTF() != token) return
-        if (version != PROTOCOL) { output.writeBoolean(false); Wire.text(output, VERSION_ERROR); output.flush(); return }
+        val request = withTimeoutOrNull(limits.requestMillis) {
+            val version = input.readInt()
+            if (!constantTimeEquals(tokenBytes, input.readUTFBytes(MAX_TOKEN_BYTES))) return@withTimeoutOrNull null
+            if (version != PROTOCOL) return@withTimeoutOrNull Request.Mismatch
+            when (val command = input.readUTF(MAX_COMMAND_BYTES)) {
+                "workers" -> Request.Command(command, input.readInt())
+                else -> Request.Command(command, null)
+            }
+        } ?: return
+        withTimeout(limits.responseMillis) { respond(request, output) }
+    }
+
+    private sealed interface Request {
+        data object Mismatch : Request
+        data class Command(val name: String, val count: Int?) : Request
+    }
+
+    private suspend fun respond(request: Request, output: MonitorOutput) {
+        if (request !is Request.Command) { failure(output, VERSION_ERROR); return }
         val snapshot = try {
-            when (input.readUTF()) {
+            when (request.name) {
                 "snapshot" -> Unit
                 "pause" -> source.pause()
                 "resume" -> source.resume()
-                "workers" -> source.setWorkerCount(input.readInt())
+                "workers" -> {
+                    val count = requireNotNull(request.count)
+                    require(count in 1..AirliftConfig.MAX_WORKERS) { "Workers must be between 1 and ${AirliftConfig.MAX_WORKERS}" }
+                    source.setWorkerCount(count)
+                }
                 else -> error("Unknown monitor command")
             }
             source.snapshot()
         } catch (cancelled: CancellationException) { throw cancelled }
-        catch (error: Exception) {
-            output.writeBoolean(false); Wire.text(output, error.message ?: "Monitor command failed"); output.flush(); return
-        }
+        catch (error: Exception) { failure(output, error.message ?: "Monitor command failed"); return }
         output.writeBoolean(true)
         Wire.write(output, snapshot)
         output.flush()
+    }
+
+    private suspend fun failure(output: MonitorOutput, message: String) {
+        output.writeBoolean(false); Wire.text(output, message.take(4096)); output.flush()
     }
 
     override fun close() {
@@ -76,7 +124,6 @@ class MonitorServer(private val source: MonitorSource, val endpoint: Path) : Aut
         try { listener.close() }
         finally {
             scope.cancel()
-            queue.cancel()
             active.value.forEach { it.close() }
             deleteConnectionFile(endpoint)
         }
@@ -86,7 +133,7 @@ class MonitorServer(private val source: MonitorSource, val endpoint: Path) : Aut
 class RemoteMonitorSource(endpoint: Path) : MonitorSource {
     private val properties = readConnectionFile(endpoint)
     init { require(properties["protocol"] == PROTOCOL.toString()) { VERSION_ERROR } }
-    private val port = requireNotNull(properties["port"]).toInt().also { require(it in 1..65535) }
+    private val port = properties["port"]?.toIntOrNull()?.takeIf { it in 1..65535 } ?: error("Invalid monitor port in $endpoint")
     private val token = properties["token"] ?: error("Missing monitor token")
     override val title = properties["title"] ?: "RSYNC AIRLIFT"
     override val from = properties["from"] ?: "?"

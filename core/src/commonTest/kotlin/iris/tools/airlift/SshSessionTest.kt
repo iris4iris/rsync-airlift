@@ -20,8 +20,9 @@ class SshSessionTest {
     private class Files : SshFiles {
         val logs = mutableMapOf<String, Sink>()
         var deleted = false
+        val created = mutableListOf<String>()
         override suspend fun temporaryDirectory(prefix: String) = Path("/tmp/airlift-test")
-        override suspend fun createDirectories(path: Path) {}
+        override suspend fun createDirectories(path: Path) { created.add(path.toString()) }
         override suspend fun readTail(path: Path, maxCharacters: Int) = "master denied"
         override suspend fun log(path: Path) = Sink().also { logs[path.toString()] = it }
         override suspend fun deleteOwnedDirectory(path: Path) { deleted = true }
@@ -48,8 +49,9 @@ class SshSessionTest {
         override suspend fun terminate(force: Boolean) { closed = true; ended.complete(Unit) }
         override suspend fun close() { closed = true; ended.complete(Unit) }
     }
-    private fun factory(files: Files, launcher: ProcessLauncher) = SshSessionFactory(
-        AirliftConfig("user@host", "/source", Path("/destination")), launcher, files,
+    private fun factory(files: Files, launcher: ProcessLauncher,
+        config: AirliftConfig = AirliftConfig("user@host", "/source", Path("/destination"))) = SshSessionFactory(
+        config, launcher, files,
         ProcessAuthentication { it }, object : DispatcherPaths { override fun absolute(path: Path) = path },
         object : DispatcherClock { override fun wallTimeMillis() = 0L; override fun monotonicNanos() = 0L },
     )
@@ -132,6 +134,60 @@ class SshSessionTest {
         assertTrue(child.closed)
         assertTrue(files.deleted)
         session.close()
+    }
+
+    @Test fun `connection check asks the master and never reconnects`() = runTest {
+        val files = Files()
+        var probeCode = 0
+        var master: Child? = null
+        val specs = mutableListOf<ProcessSpec>()
+        val session = factory(files, ProcessLauncher { spec ->
+            specs.add(spec)
+            if ("-M" in spec.command) Child(null).also { master = it } else Child(probeCode)
+        }).create(1)
+        try {
+            session.connect()
+            assertTrue(session.isConnected())
+            assertTrue(specs.last().command.containsAll(listOf("-O", "check")))
+            probeCode = 255
+            assertFalse(session.isConnected())
+            probeCode = 0
+            master!!.terminate()
+            assertFalse(session.isConnected())
+            assertEquals(1, specs.count { "-M" in it.command })
+        } finally { session.close() }
+    }
+
+    @Test fun `user ssh options follow Airlift options and upload does not create local directories`() = runTest {
+        val files = Files()
+        val specs = mutableListOf<ProcessSpec>()
+        val config = AirliftConfig("user@host", "/destination", Path("/source/a.bin"), direction = TransferDirection.UPLOAD,
+            sshOptions = "-c aes128-gcm@openssh.com -o ProxyCommand=none")
+        val session = factory(files, ProcessLauncher { spec ->
+            specs.add(spec)
+            Child(if ("-M" in spec.command) null else 0)
+        }, config).create(1)
+        try {
+            session.connect()
+            assertEquals(0, session.transfer(TransferTask("b.bin", 1, sourceRoot = "/other"), Path("upload.log")) {})
+            assertTrue(files.created.isEmpty())
+            val master = specs.first { "-M" in it.command }.command
+            assertTrue(master.indexOf("aes128-gcm@openssh.com") > master.indexOf("ServerAliveCountMax=3"))
+            assertEquals("user@host", master.last())
+            val transport = specs.first { it.command.first() == "rsync" }.command.let { it[it.indexOf("-e") + 1] }
+            assertTrue(transport.indexOf("ProxyCommand=false") < transport.indexOf("ProxyCommand=none"))
+            assertContains(transport, "'-c' 'aes128-gcm@openssh.com'")
+        } finally { session.close() }
+    }
+
+    @Test fun `download creates the local destination before rsync`() = runTest {
+        val files = Files()
+        val session = factory(files, ProcessLauncher { spec -> Child(if ("-M" in spec.command) null else 0) }).create(1)
+        try {
+            session.connect()
+            session.transfer(TransferTask("a"), Path("download.log")) {}
+            assertEquals(listOf(Path("/destination").toString()), files.created)
+        } finally { session.close() }
     }
 
     @Test fun `closing while a process starts waits for registration and leaves no orphan`() = runTest {

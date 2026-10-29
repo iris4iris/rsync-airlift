@@ -15,7 +15,8 @@ internal actual fun askTransferConfirmation(text: String, swing: Boolean): Boole
     return readlnOrNull()?.trim()?.lowercase() in setOf("y", "yes")
 }
 internal actual fun readConsolePassword(prompt: String): CharArray? = memScoped {
-    val file = fopen("/dev/tty", "r+") ?: return@memScoped null
+    // "e": O_CLOEXEC, so a child started meanwhile never inherits the terminal descriptor.
+    val file = fopen("/dev/tty", "r+e") ?: return@memScoped null
     val fd = fileno(file)
     val original = alloc<termios>()
     if (tcgetattr(fd, original.ptr) != 0) { fclose(file); return@memScoped null }
@@ -34,7 +35,8 @@ internal actual fun readConsolePassword(prompt: String): CharArray? = memScoped 
             if (airlift_stopping() != 0) return@memScoped null
             val count = read(fd, byte.ptr, 1u)
             if (count < 0 && errno == EINTR) continue
-            if (count < 0 && errno == EAGAIN) { usleep(10_000u); continue }
+            // Wake on input, or every 100 ms to notice a stop signal.
+            if (count < 0 && errno == EAGAIN) { airlift_wait_fd(fd, POLLIN, 100); continue }
             if (count <= 0) return@memScoped null
             val char = byte.value.toInt() and 255
             if (char == 10 || char == 13) break

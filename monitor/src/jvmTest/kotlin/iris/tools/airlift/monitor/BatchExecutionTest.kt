@@ -44,7 +44,10 @@ class BatchExecutionTest {
                 MonitorServer(source, endpoint.toPortablePath()).use {
                     val remote = RemoteMonitorSource(endpoint.toPortablePath()).snapshot()
                     assertEquals(3, remote.completed)
-                    assertEquals(task.files, remote.tasks.single().task.files)
+                    // Protocol 4 sends the batch size, never the file list.
+                    assertEquals(3, remote.tasks.single().task.fileTotal)
+                    assertTrue(remote.tasks.single().task.files.isEmpty())
+                    assertTrue(remote.tasks.single().task.isBatch)
                     assertEquals("b", remote.tasks.single().progress?.currentFile)
                     assertEquals(1, remote.tasks.single().progress?.transferredFiles)
                 }

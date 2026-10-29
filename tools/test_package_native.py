@@ -1,8 +1,9 @@
 """Regression checks for dpkg's explicit-directory requirement."""
+import gzip
 import io
 import tarfile
 import unittest
-from package_native import archive
+from package_native import archive, changelog
 
 
 class PackageArchiveTest(unittest.TestCase):
@@ -32,6 +33,15 @@ class PackageArchiveTest(unittest.TestCase):
         self.assertEqual(result, archive(entries, 123))
         with tarfile.open(fileobj=io.BytesIO(result), mode="r:gz") as tar:
             self.assertEqual(tar.getnames(), ['control'])
+
+    def test_changelog_is_debian_formatted_and_reproducible(self):
+        result = changelog("0.1.0", "Rsync Airlift contributors", 1700000000)
+        self.assertEqual(result, changelog("0.1.0", "Rsync Airlift contributors", 1700000000))
+        self.assertEqual(result[4:8], b"\0\0\0\0")  # no gzip timestamp
+        lines = gzip.decompress(result).decode().splitlines()
+        self.assertEqual(lines[0], "rsync-airlift (0.1.0) stable; urgency=medium")
+        self.assertTrue(lines[2].startswith("  * "))
+        self.assertEqual(lines[-1], " -- Rsync Airlift contributors  Tue, 14 Nov 2023 22:13:20 +0000")
 
 
 if __name__ == '__main__':

@@ -51,9 +51,9 @@ and enter a Debian version such as `0.1.0`. Use a higher version for each update
 (`0.1.1`, `0.1.2`, ...); do not overwrite an already published version with changed
 contents. `0.1.0~snapshot` sorts before `0.1.0`.
 
-The workflow builds the selected branch, runs core/monitor Linux Native tests,
-builds the optimized executable, creates and installs the `.deb`, and checks
-`--help`. It uploads the binary, `.deb` and SHA256SUMS as `native-release` artifacts.
+The workflow validates the committed Gradle wrapper JAR, builds the selected branch,
+runs core/monitor Linux Native tests, builds the optimized executable, creates and
+installs the `.deb`, and checks `--help`. It uploads the binary, `.deb` and SHA256SUMS as `native-release` artifacts.
 Then it builds indexes, signs `InRelease` and `Release.gpg`, verifies both signatures
 and checks `apt-get update` against the repository before deploying Pages.
 Headless terminal tests skip checks requiring an interactive PTY.
@@ -61,6 +61,16 @@ Headless terminal tests skip checks requiring an interactive PTY.
 The first deployment also creates/configures the `github-pages` environment as
 needed by GitHub. If deployment is blocked, check its branch protection rules and
 that Pages uses GitHub Actions as its source.
+
+Every action in the workflow is pinned to a full commit SHA, with its release tag
+in a comment. To update an action, resolve the new tag with
+`git ls-remote https://github.com/OWNER/REPO refs/tags/TAG` (use the `^{}` line
+for annotated tags) and change the SHA and the comment together.
+
+`Release` deliberately has no `Valid-Until` field. Publication is manual, so an
+expiry date would make `apt update` fail for every user whenever no release
+happened within the validity window. The trade-off is that APT cannot detect a
+replayed, outdated but correctly signed index.
 
 This first implementation publishes the packages from the current workflow run;
 it does not retain older package versions on Pages. Existing installations can

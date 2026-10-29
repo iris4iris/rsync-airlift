@@ -19,6 +19,8 @@ interface TransferSession {
     val failureDetails: String? get() = null
     suspend fun connect()
     suspend fun transfer(task: TransferTask, logFile: Path, progress: suspend (TransferProgress) -> Unit): Int
+    /** Checked after a failed attempt; false returns the job to the queue and reconnects the worker. */
+    suspend fun isConnected(): Boolean = true
     suspend fun close()
 }
 

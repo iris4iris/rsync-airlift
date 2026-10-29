@@ -25,6 +25,18 @@ class LinuxPlatformTest {
         } finally { platformDeleteSshDirectory(owned); platformDeleteSshDirectory(outside) }
     }
 
+    @Test fun sshDirectoriesFallBackToTmpWhenTmpdirIsUnusable() {
+        assertEquals("/tmp", sshTemporaryParent(null, "airlift-"))
+        assertEquals("/tmp", sshTemporaryParent("", "airlift-"))
+        assertEquals("/tmp", sshTemporaryParent("relative/tmp", "airlift-"))
+        assertEquals("/var/tmp", sshTemporaryParent("/var/tmp/", "airlift-"))
+        assertEquals("/", sshTemporaryParent("/", "airlift-"))
+        // 69 + "/airlift-XXXXXX/s" (17) + ssh's bind suffix (17) = 103 bytes fits; 74 would exceed sun_path.
+        assertEquals("/" + "d".repeat(68), sshTemporaryParent("/" + "d".repeat(68), "airlift-"))
+        assertEquals("/tmp", sshTemporaryParent("/" + "d".repeat(73), "airlift-"))
+        assertEquals("/tmp", sshTemporaryParent("/" + "д".repeat(40), "airlift-")) // 81 bytes in UTF-8
+    }
+
     @Test fun lockSupportsReentryAndClockAndPathsAreUsable() {
         val lock = platformLock()
         assertEquals(42, lock.locked { lock.locked { 42 } })

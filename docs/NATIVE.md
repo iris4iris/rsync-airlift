@@ -50,7 +50,9 @@ Bracketed paste is ignored rather than executed as control keys. Terminal
 lifecycle tests need a PTY; headless test runs skip those three checks.
 
 For a headless demo use `--serve-demo`.
-Ctrl+C or SIGTERM stops it and removes its connection file. The connection file
+Ctrl+C, SIGTERM or SIGHUP (terminal hangup, SSH logout) stops it and removes its
+connection file. When SIGHUP is ignored at launch (`nohup`), it stays ignored, as
+on the JVM. The connection file
 contains a token, is created exclusively with owner-only permissions (0600), and
 must not be committed or shared publicly.
 
@@ -78,6 +80,29 @@ properties compatible. Sockets bind to 127.0.0.1 only. Native socket cancellatio
 closes connections; blocking signal handlers do no Kotlin work: a POSIX handler
 sets a flag and a coroutine performs shutdown.
 
+## Processes, signals and terminal
+
+- Children start through `vfork` and `execve` in a C shim, so a large dispatcher
+  heap is not copied for every rsync job. Signals are blocked around the call; the
+  child resets caught signals and SIGPIPE to their defaults and starts with an
+  empty signal mask.
+- Children inherit only their standard descriptors. Anything else open in the
+  dispatcher, including descriptors from libraries or the launching shell, is
+  marked close-on-exec in the child (`close_range` on Linux 5.11+, otherwise a
+  bounded sweep).
+- The executable ignores SIGPIPE: a closed stdout pipe (`| head`, a dead log
+  reader) no longer kills the dispatcher and orphans its SSH masters.
+- Pipes and monitor sockets wait for readiness in one shared `poll()` thread, so an
+  idle dispatcher or monitor service does not wake up periodically. A transient
+  accept failure, such as running out of descriptors, is retried with a short
+  back-off; the service keeps accepting monitors afterwards.
+- Terminal output never blocks transfers. If the terminal stops reading (a stalled
+  SSH connection or a sleeping laptop), output is queued and new frames are skipped
+  until it drains. A hangup or terminal error only ends the panel; the transfers
+  continue as a detached service, just as when the panel is closed with Q.
+- SSH ControlMaster sockets live in `$TMPDIR`. An empty or relative `TMPDIR`, or one
+  too long for the socket path limit (108 bytes), falls back to `/tmp`.
+
 For logout survival use tmux or a service. Final database consistency still
 requires stopping writers or a consistent snapshot; live MyISAM pre-copy is not
 a consistent backup.
@@ -94,7 +119,10 @@ python tools/package_native.py
 On Windows use `./gradlew.bat` and `python` (or `py -3`). Packaging uses only
 Python's standard library and can run on Windows too. It creates a Debian ar
 container with gzip-compressed control/data tar members, root ownership, and
-executable permissions for `/usr/bin/rsync-airlift`.
+executable permissions for `/usr/bin/rsync-airlift`. The documentation directory
+contains `README.md`, `NATIVE.md` and a minimal `changelog.Debian.gz`. It has no
+`copyright` file because the project has not published a license yet; add one
+when it does.
 
 Output in `monitor/build/native-release/`:
 

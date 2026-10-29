@@ -8,7 +8,8 @@ import iris.tools.airlift.process.LinuxProcessLauncher
 import platform.posix.*
 import kotlin.native.ref.createCleaner
 
-internal fun linuxError(operation: String): Nothing = error("$operation: ${strerror(errno)?.toKString() ?: errno.toString()}")
+/** Pass [code] when other calls may have run since the failing one. */
+internal fun linuxError(operation: String, code: Int = errno): Nothing = error("$operation: ${strerror(code)?.toKString() ?: code.toString()}")
 internal class LinuxLock {
     private val pointer = nativeHeap.alloc<pthread_mutex_t>().ptr.also { check(pthread_mutex_init(it, null) == 0) }
     private val cleaner = createCleaner(pointer) { pthread_mutex_destroy(it); nativeHeap.free(it) }

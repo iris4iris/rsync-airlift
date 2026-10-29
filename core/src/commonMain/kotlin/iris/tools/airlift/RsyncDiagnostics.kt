@@ -6,7 +6,7 @@ internal class RsyncDiagnostics {
     private var firstCause: String? = null
 
     fun accept(record: String) {
-        val line = record.replace(ansi, "").filter { it >= ' ' }.trim().take(1024)
+        val line = RsyncText.decode(record.replace(ansi, "")).filter { it >= ' ' }.trim().take(1024)
         if (line.isEmpty() || line.startsWith("AIRLIFT_FILE:") || progress.containsMatchIn(line)) return
         if (firstCause == null && isPrimary(line)) firstCause = line
         if (records.size == 16) records.removeFirst()
